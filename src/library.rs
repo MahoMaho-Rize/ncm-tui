@@ -217,4 +217,25 @@ mod tests {
         assert_eq!(stats.tracks, 0);
         assert_eq!(stats.missing, 1);
     }
+
+    #[test]
+    fn importing_another_root_does_not_mark_existing_tracks_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("A - One.mp3"), b"audio").unwrap();
+        fs::write(second.join("B - Two.flac"), b"audio").unwrap();
+
+        library.scan(&[first]).unwrap();
+        let imported = library.scan(&[second]).unwrap();
+
+        assert_eq!(imported.discovered, 1);
+        assert_eq!(imported.added, 1);
+        assert_eq!(imported.missing, 0);
+        assert_eq!(library.stats().unwrap().tracks, 2);
+        assert_eq!(library.search("Two", 10).unwrap()[0].artists, "B");
+    }
 }

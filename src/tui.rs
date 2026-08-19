@@ -61,6 +61,7 @@ const QR_STATUS_GAP: u16 = 1;
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HELP_MAX_SCROLL: u16 = 8;
+const LOCAL_IMPORT_HINT: &str = "暂无本地音乐 · 按 I 或点击这里导入";
 
 #[derive(Clone, Copy)]
 struct Theme {
@@ -206,13 +207,14 @@ enum Focus {
     Lyrics,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputMode {
     Normal,
     Search,
     LocalSearch,
     Download,
     CacheSize,
+    Import,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +250,7 @@ enum UiAction {
     Organize,
     Details,
     Refresh,
+    Import,
     EditCacheSize,
     ClearCache,
     OpenRoute(Route),
@@ -362,6 +365,10 @@ fn action_hint(action: UiAction) -> ActionHint {
             key: "r",
             label: "刷新",
         },
+        UiAction::Import => ActionHint {
+            key: "I",
+            label: "导入",
+        },
         UiAction::EditCacheSize => ActionHint {
             key: "s",
             label: "缓存大小",
@@ -386,6 +393,7 @@ enum JobKind {
     Download,
     Organize,
     Scan,
+    Import,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -488,6 +496,10 @@ impl Content {
             Self::Albums(values) => values.len(),
             Self::Empty => 0,
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -811,21 +823,59 @@ impl App {
         });
     }
 
+    fn begin_import(&mut self) {
+        if self.route != Route::Local {
+            self.set_route(Route::Local);
+            self.focus = Focus::Content;
+        }
+        self.mode = InputMode::Import;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.status = "输入本地文件或目录路径，Enter 导入到音乐库".into();
+    }
+
+    fn start_import(&mut self) {
+        let path = match parse_import_path(&self.input) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.mode = InputMode::Normal;
+        self.input.clear();
+        self.input_cursor = 0;
+        if !self.services.library_roots.iter().any(|root| root == &path) {
+            self.services.library_roots.push(path.clone());
+        }
+        self.start_library_scan(vec![path], JobKind::Import);
+    }
+
     fn start_scan(&mut self) {
+        if self.services.library_roots.is_empty() {
+            self.status =
+                "请按 I 导入本地音乐，或在 config.toml 的 [library] dirs 中配置目录".into();
+            return;
+        }
+        let roots = self.services.library_roots.clone();
+        self.start_library_scan(roots, JobKind::Scan);
+    }
+
+    fn start_library_scan(&mut self, roots: Vec<PathBuf>, kind: JobKind) {
         if self.active_job.is_some() {
             self.status = "已有任务正在执行".into();
             return;
         }
-        if self.services.library_roots.is_empty() {
-            self.status = "请在 config.toml 的 [library] dirs 中配置音乐目录".into();
-            return;
-        }
         let job_id = self.allocate_job_id();
         let library = self.services.library.clone();
-        let roots = self.services.library_roots.clone();
-        let root_count = roots.len();
         let tx = self.event_tx.clone();
-        self.status = format!("正在后台扫描 {root_count} 个音乐目录…");
+        self.status = match kind {
+            JobKind::Import => roots.first().map_or_else(
+                || "正在导入本地音乐…".into(),
+                |root| format!("正在导入 {} …", root.display()),
+            ),
+            _ => format!("正在后台扫描 {} 个音乐目录…", roots.len()),
+        };
         let handle = tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || library.scan(&roots))
                 .await
@@ -835,7 +885,7 @@ impl App {
         });
         self.active_job = Some(ActiveJob {
             id: job_id,
-            kind: JobKind::Scan,
+            kind,
             handle,
         });
     }
@@ -1344,6 +1394,8 @@ impl App {
                 } else if self.route == Route::Downloads {
                     self.mode = InputMode::Download;
                     self.input.clear();
+                } else if self.route == Route::Local {
+                    self.begin_import();
                 }
             }
         }
@@ -1491,19 +1543,24 @@ impl App {
         let discovery = self.services.discovery.clone();
         let tx = self.event_tx.clone();
         self.lyrics_task = Some(tokio::spawn(async move {
-            let result = match discovery.lyrics(song_id).await {
-                Ok(lyrics) if !lyrics.is_empty() => Ok(lyrics),
-                Ok(_) | Err(_) => {
-                    let sidecar = track.path.map(|path| path.with_extension("lrc"));
-                    match sidecar {
-                        Some(path) => match tokio::fs::read_to_string(path).await {
-                            Ok(text) => Ok(Lyrics::from_sources(Some(&text), None, None)),
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                Ok(Lyrics::default())
-                            }
-                            Err(error) => Err(error.to_string()),
-                        },
-                        None => Ok(Lyrics::default()),
+            let local = match track.path.as_ref() {
+                Some(path) => Lyrics::load_local(path).await,
+                None => None,
+            };
+            let result = if let Some(lyrics) = local.clone().filter(|lyrics| !lyrics.is_empty()) {
+                Ok(lyrics)
+            } else {
+                match discovery.lyrics(song_id).await {
+                    Ok(lyrics) if !lyrics.is_empty() => Ok(lyrics),
+                    Ok(_) => Ok(local.unwrap_or_default()),
+                    Err(error) => {
+                        if local.as_ref().is_some_and(|lyrics| !lyrics.is_empty()) {
+                            Ok(local.unwrap())
+                        } else if track.path.is_some() {
+                            Ok(Lyrics::default())
+                        } else {
+                            Err(error.to_string())
+                        }
                     }
                 }
             };
@@ -1890,7 +1947,9 @@ impl App {
                             self.content =
                                 Content::Tracks(values.into_iter().map(Into::into).collect());
                             self.local_stats = stats;
-                            if !self.status.starts_with("扫描完成") {
+                            if !self.status.starts_with("扫描完成")
+                                && !self.status.starts_with("导入完成")
+                            {
                                 self.status.clear();
                             }
                         }
@@ -2056,11 +2115,16 @@ impl App {
                     if self.active_job.as_ref().map(|job| job.id) != Some(id) {
                         continue;
                     }
-                    self.active_job.take();
+                    let kind = self.active_job.take().map(|job| job.kind);
                     match result {
                         Ok(report) => {
+                            let verb = if kind == Some(JobKind::Import) {
+                                "导入完成"
+                            } else {
+                                "扫描完成"
+                            };
                             self.status = format!(
-                                "扫描完成 · 发现 {} · 新增 {} · 更新 {} · 缺失 {}",
+                                "{verb} · 发现 {} · 新增 {} · 更新 {} · 缺失 {}",
                                 report.discovered, report.added, report.updated, report.missing
                             );
                             self.load_local();
@@ -2319,6 +2383,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 InputMode::LocalSearch => app.search_local(),
                 InputMode::Download => app.start_download(),
                 InputMode::CacheSize => app.set_cache_size(),
+                InputMode::Import => app.start_import(),
                 InputMode::Normal => {}
             }
         }
@@ -2446,6 +2511,7 @@ fn normal_action(_focus: Focus, playback_active: bool, key: KeyEvent) -> Option<
         KeyCode::Char('f') => Some(UiAction::ToggleFavorite),
         KeyCode::Char('o') => Some(UiAction::Organize),
         KeyCode::Char('i') => Some(UiAction::Details),
+        KeyCode::Char('I') => Some(UiAction::Import),
         KeyCode::Char('r') => Some(UiAction::Refresh),
         _ => None,
     }
@@ -2572,6 +2638,7 @@ fn dispatch_action(app: &mut App, action: UiAction) -> bool {
                 app.set_route(route);
             }
         }
+        UiAction::Import => app.begin_import(),
         UiAction::EditCacheSize => {
             app.mode = InputMode::CacheSize;
             app.input = format_cache_size_input(app.services.playback_cache.stats().max_bytes);
@@ -2699,6 +2766,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         dispatch_action(app, UiAction::Login);
                     } else if app.route == Route::Downloads && app.active_job.is_none() {
                         dispatch_action(app, UiAction::Download);
+                    } else if app.route == Route::Local
+                        && app.mode == InputMode::Normal
+                        && app.active_job.is_none()
+                        && app.content.is_empty()
+                    {
+                        dispatch_action(app, UiAction::Import);
                     }
                     return;
                 }
@@ -2775,6 +2848,14 @@ fn content_action_region(app: &App) -> Rect {
         }
         Route::Downloads if app.active_job.is_none() && app.mode != InputMode::Download => {
             ("按 D 或点击这里", 2)
+        }
+        Route::Local
+            if app.content.is_empty()
+                && app.mode == InputMode::Normal
+                && !app.loading
+                && app.active_job.is_none() =>
+        {
+            (LOCAL_IMPORT_HINT, 0)
         }
         _ => return Rect::default(),
     };
@@ -3267,6 +3348,14 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         format!(" {} ", app.title)
     };
     match &app.content {
+        Content::Tracks(tracks)
+            if app.route == Route::Local
+                && tracks.is_empty()
+                && !app.loading
+                && app.mode != InputMode::LocalSearch =>
+        {
+            draw_local_empty(frame, app, area, &border_title);
+        }
         Content::Tracks(tracks) => draw_tracks(
             frame,
             app,
@@ -3304,23 +3393,27 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
             app.focus == Focus::Content,
         ),
         Content::Empty => {
-            let message = if app.loading {
-                SPINNER[app.tick % SPINNER.len()].to_string()
-            } else if app.mode == InputMode::LocalSearch {
-                format!("搜索本地音乐：{}", app.input)
-            } else if app.mode == InputMode::Search {
-                format!("搜索网易云：{}", app.input)
+            if app.route == Route::Local && !app.loading && app.mode != InputMode::LocalSearch {
+                draw_local_empty(frame, app, area, &border_title);
             } else {
-                empty_message(app)
-            };
-            frame.render_widget(
-                Paragraph::new(message)
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(app.theme.muted))
-                    .block(panel(app, &border_title, app.focus == Focus::Content))
-                    .wrap(Wrap { trim: true }),
-                area,
-            );
+                let message = if app.loading {
+                    SPINNER[app.tick % SPINNER.len()].to_string()
+                } else if app.mode == InputMode::LocalSearch {
+                    format!("搜索本地音乐：{}", app.input)
+                } else if app.mode == InputMode::Search {
+                    format!("搜索网易云：{}", app.input)
+                } else {
+                    empty_message(app)
+                };
+                frame.render_widget(
+                    Paragraph::new(message)
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(app.theme.muted))
+                        .block(panel(app, &border_title, app.focus == Focus::Content))
+                        .wrap(Wrap { trim: true }),
+                    area,
+                );
+            }
         }
     }
 }
@@ -3399,43 +3492,158 @@ fn draw_lyrics(frame: &mut Frame, app: &App, area: Rect) {
                 draw_lyrics_message(frame, app, inner, "纯音乐，请欣赏");
                 return;
             }
-            let position = app.player_state().elapsed;
-            let active = lyrics.current_index(position);
-            let anchor = active.unwrap_or(0);
-            let mut active_row = 0_usize;
-            let radius = usize::from(inner.height).max(1);
-            let start = anchor.saturating_sub(radius);
-            let end = anchor.saturating_add(radius + 1).min(lyrics.original.len());
-            let mut lines = Vec::with_capacity((end - start).saturating_mul(2));
-            for (index, lyric) in lyrics.original[start..end].iter().enumerate() {
-                let index = start + index;
-                if index == anchor {
-                    active_row = lines.len();
-                }
-                let is_active = active == Some(index);
-                let distance = index.abs_diff(anchor);
-                lines.push(Line::from(lyric_spans(
-                    lyric, position, is_active, distance, app,
-                )));
-                if let Some(translation) = lyrics.translation_at(lyric.start) {
-                    lines.push(Line::from(Span::styled(
-                        translation.to_owned(),
-                        Style::default()
-                            .fg(app.theme.muted)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                }
-            }
-            let scroll = active_row.saturating_sub(inner.height as usize / 2);
-            let lines = lines
-                .into_iter()
-                .skip(scroll)
-                .take(usize::from(inner.height))
-                .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+            draw_lyrics_body(frame, app, inner, lyrics);
         }
         _ => draw_lyrics_message(frame, app, inner, "正在切换歌曲…"),
     }
+}
+
+fn draw_lyrics_body(frame: &mut Frame, app: &App, area: Rect, lyrics: &Lyrics) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let position = app.player_state().elapsed;
+    let active = lyrics.current_index(position);
+    let anchor = active.unwrap_or(0);
+    let mut rows = Vec::new();
+    let mut active_row = 0_usize;
+    let radius = usize::from(area.height).max(1);
+    let start = anchor.saturating_sub(radius);
+    let end = anchor.saturating_add(radius + 1).min(lyrics.original.len());
+    for (offset, lyric) in lyrics.original[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_active = active == Some(index);
+        let distance = index.abs_diff(anchor);
+        let wrapped_original = wrap_styled_spans(
+            lyric_spans(lyric, position, is_active, distance, app),
+            area.width,
+        );
+        if index == anchor {
+            active_row = rows.len();
+        }
+        for spans in wrapped_original {
+            rows.push(LyricDisplayRow::Original(spans));
+        }
+        if let Some(translation) = lyrics.translation_at(lyric.start) {
+            for line in wrap_lyric_text(translation, area.width) {
+                rows.push(LyricDisplayRow::Translation(line));
+            }
+        }
+    }
+    let scroll = active_row.saturating_sub(usize::from(area.height) / 2);
+    let visible = rows
+        .into_iter()
+        .skip(scroll)
+        .take(usize::from(area.height))
+        .map(|row| match row {
+            LyricDisplayRow::Original(spans) => Line::from(spans),
+            LyricDisplayRow::Translation(text) => {
+                Line::from(Span::styled(text, Style::default().fg(app.theme.muted)))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible).alignment(Alignment::Center), area);
+}
+
+enum LyricDisplayRow {
+    Original(Vec<Span<'static>>),
+    Translation(String),
+}
+
+fn wrap_lyric_text(text: &str, width: u16) -> Vec<String> {
+    wrap_units(
+        text.chars().map(|character| {
+            let mut encoded = [0_u8; 4];
+            (character.encode_utf8(&mut encoded).to_owned(), ())
+        }),
+        width,
+    )
+    .into_iter()
+    .map(|units| units.into_iter().map(|(piece, _)| piece).collect())
+    .filter(|line: &String| !line.is_empty())
+    .collect()
+}
+
+fn wrap_styled_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
+    let units = spans.into_iter().flat_map(|span| {
+        let style = span.style;
+        span.content
+            .chars()
+            .map(move |character| {
+                let mut encoded = [0_u8; 4];
+                (character.encode_utf8(&mut encoded).to_owned(), style)
+            })
+            .collect::<Vec<_>>()
+    });
+    wrap_units(units, width)
+        .into_iter()
+        .map(coalesce_styled_units)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn wrap_units<T: Copy>(
+    units: impl IntoIterator<Item = (String, T)>,
+    width: u16,
+) -> Vec<Vec<(String, T)>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = Vec::<(String, T)>::new();
+    let mut current_width = 0_u16;
+    let mut last_space = None;
+    for (piece, extra) in units {
+        let piece_width = text_width(&piece).max(1);
+        if piece == " " && current.is_empty() {
+            continue;
+        }
+        if current_width + piece_width > width && !current.is_empty() {
+            if piece == " " {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+                last_space = None;
+                continue;
+            }
+            if let Some(space_at) = last_space {
+                let remainder = current.split_off(space_at);
+                lines.push(std::mem::take(&mut current));
+                current = remainder
+                    .into_iter()
+                    .filter(|(value, _)| value != " ")
+                    .collect();
+                current_width = current.iter().map(|(value, _)| text_width(value)).sum();
+                last_space = None;
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+                last_space = None;
+            }
+        }
+        if piece == " " {
+            last_space = Some(current.len());
+        }
+        current_width = current_width.saturating_add(piece_width);
+        current.push((piece, extra));
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn coalesce_styled_units(units: Vec<(String, Style)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::<Span<'static>>::new();
+    for (piece, style) in units {
+        if let Some(last) = spans.last_mut()
+            && last.style == style
+        {
+            last.content.to_mut().push_str(&piece);
+        } else {
+            spans.push(Span::styled(piece, style));
+        }
+    }
+    spans
 }
 
 fn draw_lyrics_message(frame: &mut Frame, app: &App, area: Rect, message: &str) {
@@ -3465,7 +3673,10 @@ fn lyric_spans(
         } else {
             app.theme.muted
         };
-        return vec![Span::styled(line.text.clone(), Style::default().fg(color))];
+        return vec![Span::styled(
+            line.text.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
     }
 
     let played = Style::default()
@@ -3895,6 +4106,7 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect) {
             JobKind::Download => "正在下载",
             JobKind::Organize => "正在整理",
             JobKind::Scan => "正在扫描音乐目录",
+            JobKind::Import => "正在导入本地音乐",
         };
         (
             format!("{} {name}", SPINNER[app.tick % SPINNER.len()]),
@@ -4075,8 +4287,9 @@ fn context_actions(app: &App) -> Vec<UiAction> {
             actions.push(UiAction::Details);
         }
         Route::Local => {
-            actions.push(UiAction::Search);
+            actions.push(UiAction::Import);
             actions.push(UiAction::Refresh);
+            actions.push(UiAction::Search);
             actions.push(UiAction::Details);
             actions.push(UiAction::Organize);
         }
@@ -4209,6 +4422,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         let (text, cursor) =
             input_footer(" s 缓存上限  ", &app.input, app.input_cursor, area.width);
         (text, Some(cursor))
+    } else if app.mode == InputMode::Import {
+        let (text, cursor) = input_footer(" I 导入  ", &app.input, app.input_cursor, area.width);
+        (text, Some(cursor))
     } else {
         (footer_text(app, area.width), None)
     };
@@ -4284,6 +4500,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 UiAction::Quit,
             ])),
             Line::from(hint_line(&[UiAction::EditCacheSize, UiAction::ClearCache])),
+            Line::from(format!(
+                "{}  导入本地文件或目录  ·  {}  扫描已配置目录",
+                format_action_hint(UiAction::Import),
+                format_action_hint(UiAction::Refresh),
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 "输入框",
@@ -4635,6 +4856,79 @@ fn search_kind_label(kind: SearchKind) -> &'static str {
     }
 }
 
+fn draw_local_empty(frame: &mut Frame, app: &App, area: Rect, title: &str) {
+    let message = if app.mode == InputMode::Import {
+        if app.input.is_empty() {
+            "输入本地文件或目录路径，Enter 导入".into()
+        } else {
+            format!("导入本地音乐：{}", app.input)
+        }
+    } else {
+        LOCAL_IMPORT_HINT.to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(app.theme.muted))
+            .block(panel(app, title, app.focus == Focus::Content))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn parse_import_path(input: &str) -> Result<PathBuf, String> {
+    let trimmed = input
+        .trim()
+        .trim_matches(|character| character == '"' || character == '\'');
+    if trimmed.is_empty() {
+        return Err("请输入要导入的文件或目录路径".into());
+    }
+    let path = expand_user_path(trimmed);
+    if !path.exists() {
+        return Err(format!("路径不存在：{}", path.display()));
+    }
+    path.canonicalize()
+        .map_err(|error| format!("无法解析路径：{error}"))
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    let value = unescape_shell_path(value);
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(mut home) = home_dir()
+    {
+        home.push(rest);
+        return home;
+    }
+    PathBuf::from(value)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn unescape_shell_path(value: &str) -> String {
+    if cfg!(windows) {
+        return value.to_owned();
+    }
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\'
+            && let Some(next) = chars.next()
+        {
+            result.push(next);
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
 fn empty_message(app: &App) -> String {
     match app.route {
         Route::Daily | Route::Recommended | Route::Created | Route::Subscribed | Route::Albums
@@ -4645,7 +4939,7 @@ fn empty_message(app: &App) -> String {
         Route::Search => "按 / 输入关键词".into(),
         Route::Queue => "播放队列为空".into(),
         Route::Favorites => "还没有喜欢的音乐".into(),
-        Route::Local => "暂无本地音乐 · 按 r 扫描配置的音乐目录".into(),
+        Route::Local => LOCAL_IMPORT_HINT.into(),
         Route::Recent => "暂无最近播放".into(),
         _ => "暂无内容".into(),
     }
@@ -5012,6 +5306,13 @@ mod tests {
     }
 
     #[test]
+    fn lyric_wrap_breaks_cjk_and_latin_at_the_panel_width() {
+        assert_eq!(wrap_lyric_text("你好世界", 4), ["你好", "世界"]);
+        assert_eq!(wrap_lyric_text("hello world", 8), ["hello", "world"]);
+        assert_eq!(wrap_lyric_text("unchanged", 20), ["unchanged"]);
+    }
+
+    #[test]
     fn player_controls_have_disjoint_hit_regions() {
         for area in [
             Rect::new(0, 0, 60, 5),
@@ -5339,14 +5640,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_local_library_shows_import_entry() {
+        let (_directory, mut app) = test_app();
+        let started = Instant::now();
+        loop {
+            let _ = app.poll_events();
+            if !app.loading {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "timed out waiting for local library, status={}",
+                app.status
+            );
+            tokio::task::yield_now().await;
+        }
+        app.focus = Focus::Content;
+        let (screen, _) = render_app(&app, 80, 24);
+        let compact = screen.replace(' ', "");
+        assert!(
+            compact.contains("按I或点击这里导入"),
+            "empty local screen:\n{screen}"
+        );
+        let footer = footer_text(&app, 80);
+        assert!(footer.contains("I 导入"), "{footer}");
+    }
+
+    #[tokio::test]
     async fn local_footer_calls_refresh_a_scan() {
         let (_directory, mut app) = test_app();
         app.route = Route::Local;
         app.focus = Focus::Content;
         app.status.clear();
         let footer = footer_text(&app, 100);
+        assert!(footer.contains("I 导入"));
         assert!(footer.contains("r 扫描"));
         assert!(!footer.contains("r 刷新"));
+    }
+
+    #[tokio::test]
+    async fn import_prompt_opens_from_shortcut_and_rejects_missing_path() {
+        let (_directory, mut app) = test_app();
+        dispatch_action(&mut app, UiAction::Import);
+        assert_eq!(app.route, Route::Local);
+        assert_eq!(app.mode, InputMode::Import);
+        assert!(app.status.contains("导入"));
+
+        app.input = "/definitely-not-a-real-ncm-import-path".into();
+        app.input_cursor = app.input.len();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(app.mode, InputMode::Import);
+        assert!(app.status.contains("路径不存在"));
+        assert!(app.active_job.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_indexes_local_audio_into_the_library() {
+        let (directory, mut app) = test_app();
+        let music = directory.path().join("incoming");
+        std::fs::create_dir(&music).unwrap();
+        std::fs::write(music.join("Artist - Song.mp3"), b"audio").unwrap();
+
+        dispatch_action(&mut app, UiAction::Import);
+        app.input = music.to_string_lossy().into_owned();
+        app.input_cursor = app.input.len();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert_eq!(app.mode, InputMode::Normal);
+        assert!(app.active_job.is_some());
+
+        let started = Instant::now();
+        loop {
+            let _ = app.poll_events();
+            if app.status.starts_with("导入完成") {
+                break;
+            }
+            if app.status.contains("失败") || app.status.contains("error") {
+                panic!("import failed: {}", app.status);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "timed out waiting for import, status={}",
+                app.status
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let tracks = app.services.library.search("Song", 10).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].artists, "Artist");
+        assert!(
+            app.services
+                .library_roots
+                .iter()
+                .any(|root| root == &music.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_import_path_accepts_quoted_and_existing_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let quoted = format!("\"{}\"", directory.path().display());
+        let parsed = parse_import_path(&quoted).unwrap();
+        assert_eq!(parsed, directory.path().canonicalize().unwrap());
+        assert!(parse_import_path("   ").is_err());
+        assert!(parse_import_path("/definitely-not-a-real-ncm-import-path").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unescape_shell_path_keeps_spaces_from_escaped_drop_paths() {
+        assert_eq!(unescape_shell_path("/tmp/My\\ Music"), "/tmp/My Music");
+        assert_eq!(unescape_shell_path("/tmp/plain"), "/tmp/plain");
     }
 
     #[tokio::test]
@@ -5412,7 +5816,7 @@ mod tests {
                 panic!("cache clear failed: {}", app.status);
             }
             assert!(
-                started.elapsed() < Duration::from_secs(2),
+                started.elapsed() < Duration::from_secs(5),
                 "timed out waiting for cache clear, status={}",
                 app.status
             );

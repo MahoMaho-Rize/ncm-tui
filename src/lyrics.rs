@@ -1,6 +1,11 @@
 //! Parsed, presentation-ready lyrics. Raw NCM responses stay outside the TUI.
 
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use lofty::prelude::{ItemKey, TaggedFileExt};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Lyrics {
@@ -33,6 +38,32 @@ impl Lyrics {
             original: finish_lines(original),
             translated: finish_lines(translated.map(parse_lrc).unwrap_or_default()),
         }
+    }
+
+    pub fn from_local_document(original: &str, translated: Option<&str>) -> Self {
+        if let Some(translated) = translated.filter(|text| !text.trim().is_empty()) {
+            return Self::from_sources(Some(original), Some(translated), None);
+        }
+        split_bilingual_lrc(original)
+    }
+
+    pub async fn load_local(path: &Path) -> Option<Self> {
+        let (sidecar, translation) = read_sidecar_pair(path).await;
+        if let Some(original) = sidecar.as_deref() {
+            let lyrics = Self::from_local_document(original, translation.as_deref());
+            if !lyrics.is_empty() {
+                return Some(lyrics);
+            }
+        }
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || read_embedded_lyrics(&path))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| {
+                let lyrics = Self::from_local_document(&text, None);
+                (!lyrics.is_empty()).then_some(lyrics)
+            })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -196,6 +227,87 @@ fn parse_yrc_range(value: &str) -> Option<(u64, u64)> {
     Some((start, duration))
 }
 
+fn split_bilingual_lrc(input: &str) -> Lyrics {
+    let mut lines = parse_lrc(input);
+    lines.sort_by_key(|line| line.start);
+    let mut original = Vec::new();
+    let mut translated = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let current = lines[index].clone();
+        let paired = lines.get(index + 1).filter(|next| {
+            next.start.abs_diff(current.start) <= Duration::from_millis(80)
+                && next.text != current.text
+        });
+        if let Some(next) = paired {
+            original.push(current);
+            translated.push(next.clone());
+            index += 2;
+        } else {
+            original.push(current);
+            index += 1;
+        }
+    }
+    Lyrics {
+        original: finish_lines(original),
+        translated: finish_lines(translated),
+    }
+}
+
+async fn read_sidecar_pair(path: &Path) -> (Option<String>, Option<String>) {
+    let mut original = None;
+    let mut translated = None;
+    for candidate in sidecar_candidates(path) {
+        let Ok(text) = tokio::fs::read_to_string(&candidate).await else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if is_translation_sidecar(&candidate) {
+            translated.get_or_insert(text);
+        } else {
+            original.get_or_insert(text);
+        }
+    }
+    (original, translated)
+}
+
+fn sidecar_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.with_extension("lrc"), path.with_extension("LRC")];
+    let Some(directory) = path.parent() else {
+        return paths;
+    };
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return paths;
+    };
+    for suffix in [".tlyric.lrc", ".tlyric", ".trans.lrc", ".zh.lrc", ".cn.lrc"] {
+        paths.push(directory.join(format!("{stem}{suffix}")));
+    }
+    paths
+}
+
+fn is_translation_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains(".tlyric")
+                || lower.contains(".trans.")
+                || lower.ends_with(".zh.lrc")
+                || lower.ends_with(".cn.lrc")
+        })
+}
+
+fn read_embedded_lyrics(path: &Path) -> Option<String> {
+    let file = lofty::read_from_path(path).ok()?;
+    let tag = file.primary_tag().or_else(|| file.first_tag())?;
+    tag.get_string(ItemKey::UnsyncLyrics)
+        .or_else(|| tag.get_string(ItemKey::Lyrics))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +340,40 @@ mod tests {
         let lyrics = Lyrics::from_sources(Some("[00:01]a\n[00:02]b"), None, None);
         assert_eq!(lyrics.current_index(Duration::from_millis(500)), None);
         assert_eq!(lyrics.current_index(Duration::from_millis(2_500)), Some(1));
+    }
+
+    #[test]
+    fn bilingual_sidecar_pairs_same_timestamp_as_translation() {
+        let lyrics = Lyrics::from_local_document(
+            "[00:01.00]夜に駆ける\n[00:01.00]奔向夜晚\n[00:05.00]skip\n[00:08.00]朝を待つ\n[00:08.00]等待黎明",
+            None,
+        );
+        assert_eq!(lyrics.original.len(), 3);
+        assert_eq!(lyrics.original[0].text, "夜に駆ける");
+        assert_eq!(
+            lyrics.translation_at(Duration::from_secs(1)),
+            Some("奔向夜晚")
+        );
+        assert_eq!(
+            lyrics.translation_at(Duration::from_secs(8)),
+            Some("等待黎明")
+        );
+        assert!(lyrics.translation_at(Duration::from_secs(5)).is_none());
+    }
+
+    #[tokio::test]
+    async fn load_local_reads_sidecar_before_embedded() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = directory.path().join("track.flac");
+        let lyrics = directory.path().join("track.lrc");
+        std::fs::write(&audio, b"not-a-real-flac").unwrap();
+        std::fs::write(&lyrics, "[00:01.00]本地原词\n[00:01.00]本地译文\n").unwrap();
+
+        let loaded = Lyrics::load_local(&audio).await.unwrap();
+        assert_eq!(loaded.original[0].text, "本地原词");
+        assert_eq!(
+            loaded.translation_at(Duration::from_secs(1)),
+            Some("本地译文")
+        );
     }
 }
