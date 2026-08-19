@@ -1,0 +1,14 @@
+pub mod auth;
+pub mod config;
+mod database;
+pub mod discovery;
+pub mod download;
+pub mod library;
+pub mod lyrics;
+pub mod ncm_core;
+pub mod organizer;
+pub mod playback_cache;
+pub mod player;
+mod scanner;
+pub mod streaming;
+pub mod tui;

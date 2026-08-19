@@ -1,0 +1,7 @@
+/downloads/
+/.vscode/
+/target/
+/.ncm-cache/
+/dist/
+.ncm_session
+.DS_Store

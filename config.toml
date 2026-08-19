@@ -1,0 +1,61 @@
+# ═══════════════════════════════════════════════════════════
+#  网易云音乐下载器 / 标签器 配置文件
+# ═══════════════════════════════════════════════════════════
+
+[auth]
+# 你的网易云 MUSIC_U Cookie
+# 获取方式: 浏览器登录 music.163.com → F12 → Application → Cookies → MUSIC_U
+music_u = ""
+# CSRF Token（通常留空）
+csrf = ""
+# 登录方式: auto / session / cookie / qrcode
+method = "auto"
+# 二维码或 Cookie 登录成功后的会话缓存（文件权限会设为 0600）
+session_file = ".ncm_session"
+
+[download]
+# 下载根目录（歌单/专辑会在此下建子目录）
+dir = "./downloads"
+# 仅 --mode single 时生效
+playlist_id = 0
+# 并发下载线程数（建议 3-6）
+max_workers = 4
+# 网络超时（秒）
+timeout = 30
+# NCM API 请求限速（0 表示不限制）
+api_qps = 0.0
+
+[playback_cache]
+# 流式播放缓存会跨进程保留
+dir = "./.ncm-cache/playback"
+# 默认 4 GiB
+max_bytes = 4294967296
+
+[library]
+# 本地音乐库目录（用于下载去重扫描）
+# 示例: dirs = ["/home/user/Music", "/mnt/nas/music"]
+dirs = []
+# 下载前是否扫描本地库进行去重
+scan_before_download = false
+
+[tag]
+# 要打标签的目录（为空时使用 library.dirs）
+dirs = []
+# 文本搜索失败后是否回退到音频指纹匹配
+use_fingerprint = true
+# 是否覆盖已有完整标签的文件
+overwrite = false
+# 仅匹配不写入（调试用）
+dry_run = false
+
+[acoustid]
+# AcoustID API Key（免费申请: https://acoustid.org/new-application）
+# 留空则跳过 Chromaprint/AcoustID 交叉验证
+api_key = ""
+# 是否启用 AcoustID 交叉验证（需要 fpcalc + api_key）
+enabled = false
+
+[organize]
+# 归档目标目录（将文件按专辑名移入子目录）
+dir = ""
+# 示例: dir = "/data/music/organized"
