@@ -18,6 +18,7 @@ target=${NCM_TUI_TARGET:-$(rustc -vV | awk '/^host:/{ print $2; exit }')}
     echo "could not detect rustc host target" >&2
     exit 1
 }
+dist_target=${NCM_TUI_DIST_TARGET:-$target}
 
 bin="target/${target}/release/ncm-tui"
 if [ ! -x "$bin" ]; then
@@ -46,7 +47,7 @@ chmod 755 "${stage}/ncm-tui"
 
 outdir="${root}/dist/v${version}"
 mkdir -p "$outdir"
-archive="ncm-tui-${target}.tar.gz"
+archive="ncm-tui-${dist_target}.tar.gz"
 tar -C "$stage" -czf "${outdir}/${archive}" ncm-tui
 
 sumfile="${outdir}/sha256sums.txt"

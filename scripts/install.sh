@@ -32,16 +32,36 @@ detect_target() {
     os=$(uname -s)
     arch=$(uname -m)
     case "$os" in
-        Darwin) os_tag="apple-darwin" ;;
-        Linux) os_tag="unknown-linux-gnu" ;;
-        *) err "unsupported OS: $os (supported: macOS, Linux)" ;;
+        Darwin)
+            case "$arch" in
+                arm64|aarch64) printf 'aarch64-apple-darwin\n' ;;
+                *) err "ncm-tui only supports Apple Silicon Macs, not $arch" ;;
+            esac
+            return
+            ;;
+        Linux)
+            case "$arch" in
+                x86_64|amd64) cpu="x86_64" ;;
+                arm64|aarch64) cpu="aarch64" ;;
+                *) err "unsupported architecture: $arch" ;;
+            esac
+            os_tag="unknown-linux-gnu"
+            if [ -r /etc/os-release ]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                case "${ID:-}" in
+                    fedora)
+                        if [ "$cpu" = "x86_64" ]; then
+                            os_tag="unknown-linux-fedora"
+                        fi
+                        ;;
+                esac
+            fi
+            printf '%s-%s\n' "$cpu" "$os_tag"
+            return
+            ;;
+        *) err "unsupported OS: $os (supported: macOS Apple Silicon, Linux)" ;;
     esac
-    case "$arch" in
-        x86_64|amd64) cpu="x86_64" ;;
-        arm64|aarch64) cpu="aarch64" ;;
-        *) err "unsupported architecture: $arch" ;;
-    esac
-    printf '%s-%s\n' "$cpu" "$os_tag"
 }
 
 digest_file() {
