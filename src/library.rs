@@ -47,6 +47,87 @@ pub struct LibraryStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrackSort {
+    #[default]
+    Title,
+    RecentAdded,
+    RecentPlayed,
+    MostPlayed,
+    Duration,
+    Size,
+}
+
+impl TrackSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Title => Self::RecentAdded,
+            Self::RecentAdded => Self::RecentPlayed,
+            Self::RecentPlayed => Self::MostPlayed,
+            Self::MostPlayed => Self::Duration,
+            Self::Duration => Self::Size,
+            Self::Size => Self::Title,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "标题",
+            Self::RecentAdded => "最近添加",
+            Self::RecentPlayed => "最近播放",
+            Self::MostPlayed => "最多播放",
+            Self::Duration => "时长",
+            Self::Size => "大小",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackView {
+    All,
+    Favorites,
+    Unplayed,
+    Frequent,
+    RecentAdded,
+    Incomplete,
+    Missing,
+    Large,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlbumGroup {
+    pub name: String,
+    pub artists: String,
+    pub tracks: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtistGroup {
+    pub name: String,
+    pub tracks: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionSummary {
+    pub kind: String,
+    pub id: u64,
+    pub name: String,
+    pub tracks: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrackDetail {
+    pub album_artist: String,
+    pub release_year: Option<i32>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub bitrate: u64,
+    pub audio_md5: String,
+    pub cover_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScanReport {
     pub discovered: usize,
     pub added: usize,
@@ -125,6 +206,104 @@ impl Library {
 
     pub fn queue(&self) -> Result<Vec<Track>> {
         Ok(map_tracks(self.inner.queue()?))
+    }
+
+    pub fn clear_queue(&self) -> Result<usize> {
+        Ok(self.inner.clear_queue()?)
+    }
+
+    pub fn albums(&self) -> Result<Vec<AlbumGroup>> {
+        Ok(self
+            .inner
+            .albums()?
+            .into_iter()
+            .map(|(name, artists, tracks, duration_ms)| AlbumGroup {
+                name,
+                artists,
+                tracks,
+                duration_ms,
+            })
+            .collect())
+    }
+
+    pub fn artists(&self) -> Result<Vec<ArtistGroup>> {
+        Ok(self
+            .inner
+            .artists()?
+            .into_iter()
+            .map(|(name, tracks, duration_ms)| ArtistGroup {
+                name,
+                tracks,
+                duration_ms,
+            })
+            .collect())
+    }
+
+    pub fn list_by_album(&self, album: &str, limit: usize) -> Result<Vec<Track>> {
+        Ok(map_tracks(self.inner.list_by_album(album, limit)?))
+    }
+
+    pub fn list_by_artist(&self, artists: &str, limit: usize) -> Result<Vec<Track>> {
+        Ok(map_tracks(self.inner.list_by_artist(artists, limit)?))
+    }
+
+    pub fn list_view(&self, view: TrackView, sort: TrackSort, limit: usize) -> Result<Vec<Track>> {
+        Ok(map_tracks(self.inner.list_view(view, sort, limit)?))
+    }
+
+    pub fn collections(&self) -> Result<Vec<CollectionSummary>> {
+        Ok(self
+            .inner
+            .collections()?
+            .into_iter()
+            .map(|(kind, id, name, tracks)| CollectionSummary {
+                kind,
+                id,
+                name,
+                tracks,
+            })
+            .collect())
+    }
+
+    pub fn collection_tracks(
+        &self,
+        kind: &str,
+        collection_id: u64,
+        limit: usize,
+    ) -> Result<Vec<Track>> {
+        Ok(map_tracks(self.inner.collection_tracks(
+            kind,
+            collection_id,
+            limit,
+        )?))
+    }
+
+    pub fn track_detail(&self, track_id: u64) -> Result<Option<TrackDetail>> {
+        Ok(self
+            .inner
+            .track_detail(track_id)?
+            .map(|detail| TrackDetail {
+                album_artist: detail.album_artist,
+                release_year: detail.release_year,
+                track_number: detail.track_number,
+                disc_number: detail.disc_number,
+                bitrate: detail.bitrate,
+                audio_md5: detail.audio_md5,
+                cover_url: detail.cover_url,
+            }))
+    }
+
+    pub fn history(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
+        Ok(self
+            .inner
+            .history(limit)?
+            .into_iter()
+            .map(|(track, played_at)| (map_tracks(vec![track]).remove(0), played_at))
+            .collect())
+    }
+
+    pub fn reconcile(&self) -> Result<usize> {
+        Ok(self.inner.reconcile_known_files()?)
     }
 
     pub fn record_play(&self, track_id: u64) -> Result<bool> {
@@ -237,5 +416,31 @@ mod tests {
         assert_eq!(imported.missing, 0);
         assert_eq!(library.stats().unwrap().tracks, 2);
         assert_eq!(library.search("Two", 10).unwrap()[0].artists, "B");
+    }
+
+    #[test]
+    fn groups_albums_and_filters_unplayed_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        fs::write(directory.path().join("A - One.mp3"), b"audio").unwrap();
+        fs::write(directory.path().join("A - Two.flac"), b"audio").unwrap();
+        library.scan(&[directory.path().to_path_buf()]).unwrap();
+        let albums = library.albums().unwrap();
+        assert!(
+            albums.is_empty()
+                || albums
+                    .iter()
+                    .all(|album| !album.name.is_empty() || album.tracks > 0)
+        );
+        let artists = library.artists().unwrap();
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].name, "A");
+        assert_eq!(artists[0].tracks, 2);
+        let unplayed = library
+            .list_view(TrackView::Unplayed, TrackSort::Title, 10)
+            .unwrap();
+        assert_eq!(unplayed.len(), 2);
+        library.clear_queue().unwrap();
+        assert!(library.queue().unwrap().is_empty());
     }
 }

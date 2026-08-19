@@ -5,6 +5,7 @@ use std::{
 };
 
 use lofty::prelude::{Accessor, AudioFile, TaggedFileExt};
+use lofty::tag::ItemKey;
 
 use crate::database::{DatabaseError, ScannedFile};
 
@@ -88,6 +89,11 @@ fn describe(path: &Path) -> Result<Option<ScannedFile>, DatabaseError> {
         artists: non_empty(tags.artists, fallback_artists),
         album: tags.album,
         duration_ms: tags.duration_ms,
+        album_artist: tags.album_artist,
+        release_year: tags.release_year,
+        track_number: tags.track_number,
+        disc_number: tags.disc_number,
+        bitrate: tags.bitrate,
     }))
 }
 
@@ -97,6 +103,11 @@ struct AudioMetadata {
     artists: String,
     album: String,
     duration_ms: u64,
+    album_artist: String,
+    release_year: Option<i32>,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
+    bitrate: u64,
 }
 
 fn read_audio_metadata(path: &Path) -> AudioMetadata {
@@ -125,6 +136,17 @@ fn read_audio_metadata(path: &Path) -> AudioMetadata {
             .duration()
             .as_millis()
             .min(u64::MAX as u128) as u64,
+        album_artist: tag
+            .and_then(|tag| tag.get_string(ItemKey::AlbumArtist))
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        release_year: tag
+            .and_then(Accessor::date)
+            .map(|date| i32::from(date.year)),
+        track_number: tag.and_then(Accessor::track),
+        disc_number: tag.and_then(Accessor::disk),
+        bitrate: file.properties().audio_bitrate().unwrap_or_default() as u64,
     }
 }
 
@@ -168,6 +190,7 @@ mod tests {
         assert_eq!(files[0].title, "Song");
         assert_eq!(files[0].album, "");
         assert_eq!(files[0].duration_ms, 0);
+        assert_eq!(files[0].bitrate, 0);
     }
 
     #[test]

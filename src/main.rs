@@ -45,7 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let services = Services {
         authentication: Authentication::new(client.clone(), config.auth.session_file),
-        discovery: Discovery::new(client.clone()),
+        discovery: Discovery::with_lyrics_dir(
+            client.clone(),
+            config.download.dir.join(".ncm-tui").join("lyrics"),
+        ),
         library: Library::open(&config.download.dir)?,
         downloader: Downloader::new(client, &config.download.dir, config.download.max_workers)?,
         library_roots,

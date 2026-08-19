@@ -73,6 +73,17 @@ pub struct LibraryTrack {
     pub last_played_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrackDetail {
+    pub album_artist: String,
+    pub release_year: Option<i32>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub bitrate: u64,
+    pub audio_md5: String,
+    pub cover_url: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScannedFile {
     pub path: PathBuf,
@@ -83,6 +94,11 @@ pub struct ScannedFile {
     pub artists: String,
     pub album: String,
     pub duration_ms: u64,
+    pub album_artist: String,
+    pub release_year: Option<i32>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub bitrate: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -675,6 +691,219 @@ impl LibraryDb {
         Ok(changed != 0)
     }
 
+    pub fn clear_queue(&self) -> Result<usize> {
+        let now = unix_timestamp();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute("DELETE FROM playback_queue", [])?;
+        if changed != 0 {
+            record_event(&transaction, "queue", 0, "clear", "", now)?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn albums(&self) -> Result<Vec<(String, String, u64, u64)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT album, MIN(artists), COUNT(*), COALESCE(SUM(duration_ms), 0)
+             FROM tracks
+             WHERE status='available' AND TRIM(album)<>''
+             GROUP BY album COLLATE NOCASE
+             ORDER BY album COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn artists(&self) -> Result<Vec<(String, u64, u64)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT artists, COUNT(*), COALESCE(SUM(duration_ms), 0)
+             FROM tracks
+             WHERE status='available' AND TRIM(artists)<>''
+             GROUP BY artists COLLATE NOCASE
+             ORDER BY artists COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_by_album(&self, album: &str, limit: usize) -> Result<Vec<LibraryTrack>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT ncm_id, title, artists, album, file_path, format,
+                    file_size, downloaded_at, duration_ms, favorite, play_count,
+                    last_played_at
+             FROM tracks
+             WHERE status='available' AND album=?1 COLLATE NOCASE
+             ORDER BY disc_number, track_number, title COLLATE NOCASE, ncm_id
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![album, limit as i64], map_library_track)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_by_artist(&self, artists: &str, limit: usize) -> Result<Vec<LibraryTrack>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT ncm_id, title, artists, album, file_path, format,
+                    file_size, downloaded_at, duration_ms, favorite, play_count,
+                    last_played_at
+             FROM tracks
+             WHERE status='available' AND artists=?1 COLLATE NOCASE
+             ORDER BY album COLLATE NOCASE, disc_number, track_number, ncm_id
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![artists, limit as i64], map_library_track)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_view(
+        &self,
+        view: crate::library::TrackView,
+        sort: crate::library::TrackSort,
+        limit: usize,
+    ) -> Result<Vec<LibraryTrack>> {
+        let filter = match view {
+            crate::library::TrackView::All => "status='available'",
+            crate::library::TrackView::Favorites => "status='available' AND favorite=1",
+            crate::library::TrackView::Unplayed => "status='available' AND play_count=0",
+            crate::library::TrackView::Frequent => "status='available' AND play_count>=3",
+            crate::library::TrackView::RecentAdded => "status='available'",
+            crate::library::TrackView::Incomplete => {
+                "status='available' AND (TRIM(album)='' OR TRIM(artists)='')"
+            }
+            crate::library::TrackView::Missing => "status='missing'",
+            crate::library::TrackView::Large => "status='available' AND file_size>=31457280",
+        };
+        let order = match (view, sort) {
+            (crate::library::TrackView::RecentAdded, _) => "downloaded_at DESC, ncm_id DESC",
+            (_, crate::library::TrackSort::Title) => {
+                "title COLLATE NOCASE, artists COLLATE NOCASE, ncm_id"
+            }
+            (_, crate::library::TrackSort::RecentAdded) => "downloaded_at DESC, ncm_id DESC",
+            (_, crate::library::TrackSort::RecentPlayed) => {
+                "last_played_at DESC, play_count DESC, ncm_id DESC"
+            }
+            (_, crate::library::TrackSort::MostPlayed) => "play_count DESC, ncm_id DESC",
+            (_, crate::library::TrackSort::Duration) => "duration_ms DESC, ncm_id",
+            (_, crate::library::TrackSort::Size) => "file_size DESC, ncm_id",
+        };
+        let sql = format!(
+            "SELECT ncm_id, title, artists, album, file_path, format,
+                    file_size, downloaded_at, duration_ms, favorite, play_count,
+                    last_played_at
+             FROM tracks
+             WHERE {filter}
+             ORDER BY {order}
+             LIMIT ?1"
+        );
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map([limit as i64], map_library_track)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn collections(&self) -> Result<Vec<(String, u64, String, u64)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT c.kind, c.ncm_id, c.name, COUNT(t.track_id)
+             FROM collections c
+             LEFT JOIN collection_tracks t
+               ON t.collection_kind=c.kind AND t.collection_id=c.ncm_id
+             GROUP BY c.kind, c.ncm_id, c.name
+             ORDER BY c.kind, c.name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn collection_tracks(
+        &self,
+        kind: &str,
+        collection_id: u64,
+        limit: usize,
+    ) -> Result<Vec<LibraryTrack>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path, t.format,
+                    t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
+                    t.play_count, t.last_played_at
+             FROM collection_tracks c
+             JOIN tracks t ON t.ncm_id=c.track_id
+             WHERE c.collection_kind=?1 AND c.collection_id=?2 AND t.status='available'
+             ORDER BY c.position, t.ncm_id
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![kind, collection_id as i64, limit as i64],
+            map_library_track,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn history(&self, limit: usize) -> Result<Vec<(LibraryTrack, i64)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path, t.format,
+                    t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
+                    t.play_count, t.last_played_at, h.played_at
+             FROM playback_history h
+             JOIN tracks t ON t.ncm_id=h.track_id
+             ORDER BY h.played_at DESC, h.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok((map_library_track(row)?, row.get::<_, i64>(12)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn track_detail(&self, track_id: u64) -> Result<Option<TrackDetail>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT album_artist, release_year, track_number, disc_number,
+                        bitrate, audio_md5, cover_url
+                 FROM tracks WHERE ncm_id=?1",
+                [track_id as i64],
+                |row| {
+                    Ok(TrackDetail {
+                        album_artist: row.get(0)?,
+                        release_year: row.get(1)?,
+                        track_number: row.get::<_, Option<i64>>(2)?.map(|value| value as u32),
+                        disc_number: row.get::<_, Option<i64>>(3)?.map(|value| value as u32),
+                        bitrate: row.get::<_, i64>(4)? as u64,
+                        audio_md5: row.get(5)?,
+                        cover_url: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn queue(&self) -> Result<Vec<LibraryTrack>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare_cached(
@@ -821,8 +1050,10 @@ impl LibraryDb {
             if let Some((track_id, size, modified_ns, present)) = existing {
                 transaction.execute(
                     "UPDATE tracks SET title=?1, artists=?2, album=?3, duration_ms=?4,
-                         file_path=?5, file_size=?6, format=?7, status='available', updated_at=?8
-                     WHERE ncm_id=?9 AND source_kind='local'",
+                         file_path=?5, file_size=?6, format=?7, album_artist=?8,
+                         release_year=?9, track_number=?10, disc_number=?11, bitrate=?12,
+                         status='available', updated_at=?13
+                     WHERE ncm_id=?14 AND source_kind='local'",
                     params![
                         file.title,
                         file.artists,
@@ -831,6 +1062,11 @@ impl LibraryDb {
                         path,
                         file.file_size as i64,
                         file.format,
+                        file.album_artist,
+                        file.release_year,
+                        file.track_number.map(|value| value as i64),
+                        file.disc_number.map(|value| value as i64),
+                        file.bitrate as i64,
                         now,
                         track_id
                     ],
@@ -878,10 +1114,11 @@ impl LibraryDb {
                 transaction.execute(
                     "INSERT INTO tracks(
                          ncm_id, title, artists, album, duration_ms, file_path, file_size,
-                         format, status, downloaded_at, updated_at, source_kind, source_id
+                         format, album_artist, release_year, track_number, disc_number,
+                         bitrate, status, downloaded_at, updated_at, source_kind, source_id
                      ) VALUES(
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                         'available', ?9, ?9, 'local', ?6
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         'available', ?14, ?14, 'local', ?6
                      )",
                     params![
                         track_id,
@@ -892,6 +1129,11 @@ impl LibraryDb {
                         path,
                         file.file_size as i64,
                         file.format,
+                        file.album_artist,
+                        file.release_year,
+                        file.track_number.map(|value| value as i64),
+                        file.disc_number.map(|value| value as i64),
+                        file.bitrate as i64,
                         now
                     ],
                 )?;

@@ -1,11 +1,14 @@
 //! Parsed, presentation-ready lyrics. Raw NCM responses stay outside the TUI.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use lofty::prelude::{ItemKey, TaggedFileExt};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Lyrics {
@@ -88,6 +91,93 @@ impl Lyrics {
             .filter(|line| line.start.abs_diff(start) <= Duration::from_millis(80))
             .min_by_key(|line| line.start.abs_diff(start))
             .map(|line| line.text.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LyricDocument {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lrc: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tlyric: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub yrc: String,
+}
+
+impl LyricDocument {
+    pub fn is_empty(&self) -> bool {
+        self.lrc.trim().is_empty() && self.tlyric.trim().is_empty() && self.yrc.trim().is_empty()
+    }
+
+    pub fn into_lyrics(self) -> Lyrics {
+        Lyrics::from_sources(
+            opt_text(&self.lrc),
+            opt_text(&self.tlyric),
+            opt_text(&self.yrc),
+        )
+    }
+}
+
+fn opt_text(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LyricsCache {
+    dir: Option<PathBuf>,
+    memory: Arc<Mutex<HashMap<u64, LyricDocument>>>,
+}
+
+impl LyricsCache {
+    pub fn open(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let _ = std::fs::create_dir_all(&dir);
+        Self {
+            dir: Some(dir),
+            memory: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn memory_get(&self, song_id: u64) -> Option<LyricDocument> {
+        self.memory.lock().ok()?.get(&song_id).cloned()
+    }
+
+    pub fn get(&self, song_id: u64) -> Option<LyricDocument> {
+        if let Some(document) = self.memory_get(song_id) {
+            return Some(document);
+        }
+        let path = self.path(song_id)?;
+        let document = serde_json::from_str::<LyricDocument>(&std::fs::read_to_string(path).ok()?)
+            .ok()
+            .filter(|document| !document.is_empty())?;
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.insert(song_id, document.clone());
+        }
+        Some(document)
+    }
+
+    pub fn put(&self, song_id: u64, document: LyricDocument) {
+        if document.is_empty() {
+            return;
+        }
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.insert(song_id, document.clone());
+        }
+        let Some(path) = self.path(song_id) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&document) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    fn path(&self, song_id: u64) -> Option<PathBuf> {
+        self.dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{song_id}.json")))
     }
 }
 
@@ -375,5 +465,32 @@ mod tests {
             loaded.translation_at(Duration::from_secs(1)),
             Some("本地译文")
         );
+    }
+
+    #[test]
+    fn lyrics_cache_round_trips_sources_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = LyricsCache::open(directory.path());
+        let document = LyricDocument {
+            lrc: "[00:01]hello".into(),
+            tlyric: "[00:01]你好".into(),
+            yrc: "[1000,1000](1000,500,0)hello".into(),
+        };
+        cache.put(42, document.clone());
+        assert_eq!(cache.memory_get(42).as_ref(), Some(&document));
+
+        let cold = LyricsCache::open(directory.path());
+        let restored = cold.get(42).unwrap();
+        assert_eq!(restored, document);
+        assert_eq!(restored.into_lyrics().original[0].text, "hello");
+        assert!(LyricsCache::open(directory.path()).get(7).is_none());
+    }
+
+    #[test]
+    fn lyrics_cache_skips_empty_documents() {
+        let cache = LyricsCache::default();
+        cache.put(1, LyricDocument::default());
+        assert!(cache.get(1).is_none());
+        assert!(cache.memory_get(1).is_none());
     }
 }

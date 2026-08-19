@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod cover;
 mod database;
 pub mod discovery;
 pub mod download;

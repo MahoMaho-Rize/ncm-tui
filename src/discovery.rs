@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::download::AudioQuality;
-use crate::lyrics::Lyrics;
+use crate::lyrics::{LyricDocument, Lyrics, LyricsCache};
 use crate::ncm_core::{
     NcmClient, NcmError,
     api::{self, search::SearchType, user::ListeningRank},
@@ -161,6 +161,7 @@ struct DiscoveryCache {
     user_playlists: KeyedCache<u64, Vec<PlaylistSummary>>,
     playlist_catalogs: Mutex<HashMap<u64, Arc<Mutex<PlaylistCatalog>>>>,
     listening_ranks: KeyedCache<(u64, bool), Vec<RankedTrack>>,
+    lyrics: LyricsCache,
 }
 
 impl Discovery {
@@ -169,6 +170,23 @@ impl Discovery {
             client,
             cache: Arc::new(DiscoveryCache::default()),
         }
+    }
+
+    pub fn with_lyrics_dir(client: NcmClient, dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            client,
+            cache: Arc::new(DiscoveryCache {
+                lyrics: LyricsCache::open(dir.into()),
+                ..DiscoveryCache::default()
+            }),
+        }
+    }
+
+    pub fn cached_lyrics(&self, song_id: u64) -> Option<Lyrics> {
+        self.cache
+            .lyrics
+            .memory_get(song_id)
+            .map(LyricDocument::into_lyrics)
     }
 
     pub async fn track_details(&self, track_ids: &[u64]) -> Result<Vec<OnlineTrack>> {
@@ -228,17 +246,28 @@ impl Discovery {
     }
 
     pub async fn lyrics(&self, song_id: u64) -> Result<Lyrics> {
+        if let Some(document) = self.cache.lyrics.get(song_id) {
+            return Ok(document.into_lyrics());
+        }
+        let document = self.fetch_lyric_document(song_id).await?;
+        if !document.is_empty() {
+            self.cache.lyrics.put(song_id, document.clone());
+        }
+        Ok(document.into_lyrics())
+    }
+
+    async fn fetch_lyric_document(&self, song_id: u64) -> Result<LyricDocument> {
         let primary = self.client.execute(api::track::lyrics_v1(song_id)).await;
         if let Ok(response) = primary
             && let Ok(response) = checked(response)
         {
-            let lyrics = parse_lyrics(&response);
-            if !lyrics.is_empty() {
-                return Ok(lyrics);
+            let document = parse_lyric_document(&response);
+            if !document.is_empty() {
+                return Ok(document);
             }
         }
         let response = checked(self.client.execute(api::track::lyrics(song_id)).await?)?;
-        Ok(parse_lyrics(&response))
+        Ok(parse_lyric_document(&response))
     }
 
     pub async fn daily_songs(&self) -> Result<Vec<OnlineTrack>> {
@@ -968,11 +997,14 @@ fn checked(response: Value) -> Result<Value> {
     }
 }
 
-fn parse_lyrics(response: &Value) -> Lyrics {
-    let lyric = lyric_text(response, "lrc");
-    let translated = lyric_text(response, "tlyric");
-    let yrc = lyric_text(response, "yrc");
-    Lyrics::from_sources(lyric, translated, yrc)
+fn parse_lyric_document(response: &Value) -> LyricDocument {
+    LyricDocument {
+        lrc: lyric_text(response, "lrc").unwrap_or_default().to_owned(),
+        tlyric: lyric_text(response, "tlyric")
+            .unwrap_or_default()
+            .to_owned(),
+        yrc: lyric_text(response, "yrc").unwrap_or_default().to_owned(),
+    }
 }
 
 fn lyric_text<'a>(response: &'a Value, key: &str) -> Option<&'a str> {
@@ -1193,15 +1225,31 @@ mod tests {
 
     #[test]
     fn lyrics_prefer_word_timing_and_keep_translation() {
-        let lyrics = parse_lyrics(&json!({
+        let lyrics = parse_lyric_document(&json!({
             "lrc": { "lyric": "[00:01]fallback" },
             "tlyric": { "lyric": "[00:01]翻译" },
             "yrc": { "lyric": "[1000,1000](1000,500,0)timed" }
-        }));
+        }))
+        .into_lyrics();
         assert_eq!(lyrics.original[0].text, "timed");
         assert_eq!(
             lyrics.translation_at(std::time::Duration::from_secs(1)),
             Some("翻译")
         );
+    }
+
+    #[test]
+    fn lyric_document_cache_preserves_yrc_and_translation() {
+        let document = parse_lyric_document(&json!({
+            "lrc": { "lyric": "[00:01]fallback" },
+            "tlyric": { "lyric": "[00:01]翻译" },
+            "yrc": { "lyric": "[1000,1000](1000,500,0)timed" }
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let cache = LyricsCache::open(directory.path());
+        cache.put(9, document.clone());
+        let restored = LyricsCache::open(directory.path()).get(9).unwrap();
+        assert_eq!(restored, document);
+        assert_eq!(restored.into_lyrics().original[0].text, "timed");
     }
 }
