@@ -106,6 +106,7 @@ pub struct OnlineTrack {
     pub artists: String,
     pub album: String,
     pub duration_ms: u64,
+    pub cover_url: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +163,7 @@ struct DiscoveryCache {
     playlist_catalogs: Mutex<HashMap<u64, Arc<Mutex<PlaylistCatalog>>>>,
     listening_ranks: KeyedCache<(u64, bool), Vec<RankedTrack>>,
     lyrics: LyricsCache,
+    covers: crate::cover::CoverCache,
 }
 
 impl Discovery {
@@ -173,10 +175,16 @@ impl Discovery {
     }
 
     pub fn with_lyrics_dir(client: NcmClient, dir: impl Into<std::path::PathBuf>) -> Self {
+        let lyrics = dir.into();
+        let covers = lyrics
+            .parent()
+            .map(|parent| parent.join("covers"))
+            .unwrap_or_else(|| lyrics.join("covers"));
         Self {
             client,
             cache: Arc::new(DiscoveryCache {
-                lyrics: LyricsCache::open(dir.into()),
+                lyrics: LyricsCache::open(lyrics),
+                covers: crate::cover::CoverCache::open(covers),
                 ..DiscoveryCache::default()
             }),
         }
@@ -208,6 +216,88 @@ impl Discovery {
             .iter()
             .filter_map(|id| tracks.remove(id))
             .collect())
+    }
+
+    pub async fn song_cover_url(&self, song_id: u64) -> Result<String> {
+        Ok(self
+            .track_details(&[song_id])
+            .await?
+            .into_iter()
+            .next()
+            .map(|track| track.cover_url)
+            .filter(|url| !url.is_empty())
+            .unwrap_or_default())
+    }
+
+    pub async fn fetch_cover(&self, url: &str) -> Result<Vec<u8>> {
+        if url.is_empty() {
+            return Err(DiscoveryError::InvalidResponse("cover url"));
+        }
+        Ok(self
+            .client
+            .get_bytes(&crate::cover::ncm_thumb_url(url))
+            .await?)
+    }
+
+    pub async fn load_cover_image(
+        &self,
+        song_id: u64,
+        title: &str,
+        artists: &str,
+        album: &str,
+        known_url: Option<String>,
+    ) -> Option<(Vec<u8>, Option<String>)> {
+        if let Some(bytes) = self.cache.covers.get(song_id) {
+            return Some((bytes, None));
+        }
+        if self.cache.covers.is_miss(song_id) && known_url.is_none() {
+            return None;
+        }
+        let mut resolved = known_url.and_then(|url| crate::cover::nonempty_url(&url));
+        if resolved.is_none() && crate::library::is_catalog_id(song_id) {
+            resolved =
+                crate::cover::nonempty_url(&self.song_cover_url(song_id).await.unwrap_or_default());
+        }
+        if resolved.is_none() {
+            resolved = self.search_cover_url(title, artists, album).await;
+        }
+        let Some(url) = resolved else {
+            self.cache.covers.remember_miss(song_id);
+            return None;
+        };
+        match self.fetch_cover(&url).await {
+            Ok(bytes) if crate::cover::looks_like_image(&bytes) => {
+                self.cache.covers.put(song_id, &bytes);
+                Some((bytes, Some(url)))
+            }
+            Ok(_) => {
+                self.cache.covers.remember_miss(song_id);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub async fn search_cover_url(
+        &self,
+        title: &str,
+        artists: &str,
+        album: &str,
+    ) -> Option<String> {
+        let query = cover_search_query(title, artists, album);
+        if query.is_empty() {
+            return None;
+        }
+        let page = self
+            .search_page(&query, SearchKind::Song, 0, 8)
+            .await
+            .ok()?;
+        page.tracks
+            .into_iter()
+            .filter(|track| !track.cover_url.is_empty())
+            .max_by_key(|track| cover_match_score(title, artists, album, track))
+            .filter(|track| cover_match_score(title, artists, album, track) >= 50)
+            .map(|track| track.cover_url)
     }
 
     pub async fn playback_source(
@@ -1105,7 +1195,69 @@ fn parse_track(value: &Value) -> Option<OnlineTrack> {
         duration_ms: number_at(value, "dt")
             .or_else(|| number_at(value, "duration"))
             .unwrap_or_default(),
+        cover_url: parse_cover_url(value, album),
     })
+}
+
+pub(crate) fn cover_search_query(title: &str, artists: &str, album: &str) -> String {
+    [title, artists, album]
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn cover_match_score(
+    title: &str,
+    artists: &str,
+    album: &str,
+    track: &OnlineTrack,
+) -> i32 {
+    let title = normalize_cover_text(title);
+    let artists = normalize_cover_text(artists);
+    let album = normalize_cover_text(album);
+    let got_title = normalize_cover_text(&track.title);
+    let got_artists = normalize_cover_text(&track.artists);
+    let got_album = normalize_cover_text(&track.album);
+    let mut score = 0;
+    if !title.is_empty() && got_title == title {
+        score += 100;
+    } else if !title.is_empty() && (got_title.contains(&title) || title.contains(&got_title)) {
+        score += 50;
+    }
+    if !artists.is_empty() && (got_artists.contains(&artists) || artists.contains(&got_artists)) {
+        score += 30;
+    }
+    if !album.is_empty() && (got_album.contains(&album) || album.contains(&got_album)) {
+        score += 10;
+    }
+    score
+}
+
+fn normalize_cover_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn parse_cover_url(song: &Value, album: Option<&Value>) -> String {
+    const KEYS: &[&str] = &["picUrl", "coverUrl", "blurPicUrl", "img1v1Url"];
+    for source in [album, Some(song)] {
+        let Some(value) = source else {
+            continue;
+        };
+        for key in KEYS {
+            let url = string_at(value, key);
+            if !url.is_empty() && url.starts_with("http") {
+                return url;
+            }
+        }
+    }
+    String::new()
 }
 
 fn append_unique(target: &mut Vec<u64>, seen: &mut HashSet<u64>, ids: Vec<u64>) {
@@ -1202,11 +1354,54 @@ mod tests {
 
         let track = parse_track(&json!({
             "id": 3, "name": "song", "dt": 1000,
-            "ar": [{ "name": "artist" }], "al": { "name": "record" }
+            "ar": [{ "name": "artist" }],
+            "al": { "name": "record", "picUrl": "https://p1.music.126.net/cover.jpg" }
         }))
         .unwrap();
         assert_eq!(track.artists, "artist");
         assert_eq!(track.album, "record");
+        assert_eq!(track.cover_url, "https://p1.music.126.net/cover.jpg");
+    }
+
+    #[test]
+    fn cover_search_prefers_title_and_artist_matches() {
+        let exact = OnlineTrack {
+            id: 1,
+            title: "晴天".into(),
+            artists: "周杰伦".into(),
+            album: "叶惠美".into(),
+            duration_ms: 1,
+            cover_url: "https://p1.music.126.net/a.jpg".into(),
+        };
+        let weak = OnlineTrack {
+            id: 2,
+            title: "七里香".into(),
+            artists: "周杰伦".into(),
+            album: String::new(),
+            duration_ms: 1,
+            cover_url: "https://p1.music.126.net/b.jpg".into(),
+        };
+        assert!(cover_match_score("晴天", "周杰伦", "叶惠美", &exact) >= 50);
+        assert!(
+            cover_match_score("晴天", "周杰伦", "叶惠美", &exact)
+                > cover_match_score("晴天", "周杰伦", "叶惠美", &weak)
+        );
+        assert_eq!(
+            cover_search_query("晴天", "周杰伦", "叶惠美"),
+            "晴天 周杰伦"
+        );
+    }
+
+    #[test]
+    fn cover_url_falls_back_across_album_and_song_fields() {
+        let track = parse_track(&json!({
+            "id": 4, "name": "song", "dt": 1,
+            "ar": [{ "name": "a" }],
+            "al": { "name": "record" },
+            "blurPicUrl": "https://p2.music.126.net/blur.jpg"
+        }))
+        .unwrap();
+        assert_eq!(track.cover_url, "https://p2.music.126.net/blur.jpg");
     }
 
     #[test]

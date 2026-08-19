@@ -88,7 +88,7 @@ pub(super) struct App {
     pub(super) queue_index: Option<usize>,
     pub(super) play_mode: PlayMode,
     pub(super) completion_latched: bool,
-    pub(super) show_lyrics: bool,
+    pub(super) expanded: bool,
     pub(super) lyrics_hidden: bool,
     pub(super) previous_focus: Focus,
     pub(super) lyrics: LyricsState,
@@ -126,10 +126,13 @@ pub(super) struct App {
     pub(super) local_sort: TrackSort,
     pub(super) cover_bytes: Option<Vec<u8>>,
     pub(super) cover_player: Option<crate::cover::CoverArt>,
-    pub(super) cover_picker: Option<ratatui_image::picker::Picker>,
-    pub(super) cover_kitty_nav: Option<ratatui_image::protocol::StatefulProtocol>,
-    pub(super) cover_kitty_player: Option<ratatui_image::protocol::StatefulProtocol>,
-    pub(super) content_expanded: bool,
+    pub(super) cover_nav: Option<crate::cover::CoverArt>,
+    pub(super) cover_picker: ratatui_image::picker::Picker,
+    pub(super) cover_protocol_player: Option<ratatui_image::protocol::StatefulProtocol>,
+    pub(super) cover_protocol_nav: Option<ratatui_image::protocol::StatefulProtocol>,
+    pub(super) cover_track: Option<u64>,
+    pub(super) cover_task: Option<JoinHandle<()>>,
+    pub(super) progress_stamp: (u64, u16, usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,7 +188,7 @@ impl App {
             queue_index: None,
             play_mode: PlayMode::Sequential,
             completion_latched: false,
-            show_lyrics: false,
+            expanded: false,
             lyrics_hidden,
             previous_focus: Focus::Content,
             lyrics: LyricsState::Idle,
@@ -223,10 +226,13 @@ impl App {
             local_sort: TrackSort::Title,
             cover_bytes: None,
             cover_player: None,
-            cover_picker: crate::cover::kitty_picker(),
-            cover_kitty_nav: None,
-            cover_kitty_player: None,
-            content_expanded: false,
+            cover_nav: None,
+            cover_picker: crate::cover::build_picker(),
+            cover_protocol_player: None,
+            cover_protocol_nav: None,
+            cover_track: None,
+            cover_task: None,
+            progress_stamp: (u64::MAX, 0, usize::MAX),
         };
         app.load_local();
         #[cfg(not(test))]
@@ -924,7 +930,7 @@ impl App {
                 self.help_scroll = 0;
             }
             PaletteCommand::HideLyrics => self.set_lyrics_hidden(!self.lyrics_hidden),
-            PaletteCommand::Expand => self.toggle_content_expand(),
+            PaletteCommand::Expand => self.toggle_expand(),
         }
     }
 
@@ -1247,8 +1253,12 @@ impl App {
     pub(super) fn back(&mut self) {
         match self.focus {
             Focus::Lyrics => {
-                self.show_lyrics = false;
-                self.focus = self.valid_focus(self.previous_focus);
+                if self.expanded {
+                    self.expanded = false;
+                    self.status = "已回到分栏浏览".into();
+                } else {
+                    self.focus = self.valid_focus(self.previous_focus);
+                }
             }
             Focus::Column(index) => {
                 self.truncate_columns(index);
@@ -1530,7 +1540,7 @@ impl App {
                 track.path = Some(path.clone());
                 self.current = Some(track.id);
                 self.current_track = Some(track.clone());
-                self.load_covers(Some(&path));
+                self.load_covers(&track, Some(&path));
                 self.completion_latched = false;
                 let _ = self.services.library.record_play(track.id);
                 self.load_lyrics(track);
@@ -1540,32 +1550,81 @@ impl App {
         }
     }
 
-    pub(super) fn load_covers(&mut self, path: Option<&std::path::Path>) {
-        self.cover_bytes = path.and_then(crate::cover::picture_bytes);
-        self.cover_kitty_nav = None;
-        self.cover_kitty_player = None;
+    pub(super) fn load_covers(&mut self, track: &TrackRow, path: Option<&std::path::Path>) {
+        if let Some(task) = self.cover_task.take() {
+            task.abort();
+        }
+        let song_id = track.id;
+        self.cover_track = Some(song_id);
+        self.cover_bytes = None;
         self.cover_player = None;
-        let Some(bytes) = self.cover_bytes.as_deref() else {
-            return;
-        };
-        if let Some(picker) = self.cover_picker.as_ref()
-            && let Some((nav, player)) = crate::cover::kitty_protocols(picker, bytes)
+        self.cover_nav = None;
+        self.cover_protocol_player = None;
+        self.cover_protocol_nav = None;
+        if let Some(path) = path
+            && let Some(bytes) = crate::cover::picture_bytes(path)
+            && self.apply_cover_bytes(bytes)
         {
-            self.cover_kitty_nav = Some(nav);
-            self.cover_kitty_player = Some(player);
             return;
         }
-        self.cover_player = crate::cover::from_bytes(bytes, 6, 3);
+        let known_url = crate::cover::nonempty_url(&track.cover_url).or_else(|| {
+            self.services
+                .library
+                .track_detail(song_id)
+                .ok()
+                .flatten()
+                .and_then(|detail| crate::cover::nonempty_url(&detail.cover_url))
+        });
+        let discovery = self.services.discovery.clone();
+        let library = self.services.library.clone();
+        let title = track.title.clone();
+        let artists = track.artists.clone();
+        let album = track.album.clone();
+        let tx = self.event_tx.clone();
+        self.cover_task = Some(tokio::spawn(async move {
+            let Some((bytes, resolved_url)) = discovery
+                .load_cover_image(song_id, &title, &artists, &album, known_url)
+                .await
+            else {
+                return;
+            };
+            if let Some(url) = resolved_url {
+                let _ = library.set_cover_url(song_id, &url);
+            }
+            let _ = tx.send(AppEvent::CoverLoaded(song_id, bytes));
+        }));
     }
 
-    pub(super) fn toggle_content_expand(&mut self) {
-        if self.content_expanded {
-            self.content_expanded = false;
+    fn apply_cover_bytes(&mut self, bytes: Vec<u8>) -> bool {
+        if !crate::cover::looks_like_image(&bytes) {
+            return false;
+        }
+        self.cover_player = None;
+        self.cover_nav = None;
+        self.cover_protocol_player = None;
+        self.cover_protocol_nav = crate::cover::protocol_from_bytes(&self.cover_picker, &bytes);
+        self.cover_bytes = Some(bytes);
+        true
+    }
+
+    pub(super) fn toggle_expand(&mut self) {
+        if self.expanded {
+            self.expanded = false;
             self.status = "已回到分栏浏览".into();
             return;
         }
-        if matches!(self.focus, Focus::Content | Focus::Column(_)) {
-            self.content_expanded = true;
+        if self.focus == Focus::Lyrics && self.lyrics_hidden {
+            self.set_lyrics_hidden(false);
+            self.focus = Focus::Lyrics;
+        }
+        if matches!(
+            self.focus,
+            Focus::Content | Focus::Column(_) | Focus::Lyrics | Focus::Navigation
+        ) {
+            if self.focus == Focus::Navigation {
+                self.focus = Focus::Content;
+            }
+            self.expanded = true;
             self.status = "已展开当前栏 · 切页保持展开 · 按 e 回到分栏".into();
         }
     }
@@ -1584,7 +1643,7 @@ impl App {
                     .or_else(|| self.services.library.track_path(track.id).ok().flatten());
                 self.current = Some(track.id);
                 self.current_track = Some(track.clone());
-                self.load_covers(path.as_deref());
+                self.load_covers(&track, path.as_deref());
                 self.completion_latched = false;
                 let _ = self.services.library.record_play(track.id);
                 self.load_lyrics(track);
@@ -1929,18 +1988,12 @@ impl App {
             (current + 1) % order.len()
         };
         self.focus = order[next];
-        if self.focus != Focus::Lyrics {
-            self.show_lyrics = false;
-        }
     }
 
     pub(super) fn set_lyrics_hidden(&mut self, hidden: bool) {
         self.lyrics_hidden = hidden;
-        if hidden {
-            if self.focus == Focus::Lyrics {
-                self.focus = self.valid_focus(self.previous_focus);
-            }
-            self.show_lyrics = false;
+        if hidden && self.focus == Focus::Lyrics {
+            self.focus = self.valid_focus(self.previous_focus);
         }
         save_hide_lyrics(&self.services.ui_state_path, hidden);
         self.status = if hidden {
@@ -1954,20 +2007,10 @@ impl App {
     pub(super) fn toggle_lyrics_focus(&mut self) {
         if self.lyrics_hidden {
             self.set_lyrics_hidden(false);
-            self.previous_focus = self.valid_focus(self.focus);
-            self.focus = Focus::Lyrics;
-            self.show_lyrics = true;
-            return;
         }
-        if self.focus == Focus::Lyrics && self.show_lyrics {
-            self.focus = self.valid_focus(self.previous_focus);
-            self.show_lyrics = false;
-        } else if self.focus == Focus::Lyrics {
-            self.show_lyrics = true;
-        } else {
+        if self.focus != Focus::Lyrics {
             self.previous_focus = self.valid_focus(self.focus);
             self.focus = Focus::Lyrics;
-            self.show_lyrics = true;
         }
     }
 
@@ -2447,6 +2490,11 @@ impl App {
                         }
                     }
                 }
+                AppEvent::CoverLoaded(song_id, bytes) => {
+                    if self.cover_track == Some(song_id) && self.current == Some(song_id) {
+                        let _ = self.apply_cover_bytes(bytes);
+                    }
+                }
                 AppEvent::LyricsLoaded(song_id, result) => {
                     if self.current != Some(song_id) {
                         continue;
@@ -2577,6 +2625,9 @@ impl Drop for App {
         if let Some(task) = self.cache_task.take() {
             task.abort();
         }
+        if let Some(task) = self.cover_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -2606,11 +2657,24 @@ impl Drop for TerminalGuard {
     }
 }
 
+pub(super) fn playback_stamp(app: &App) -> (u64, u16, usize) {
+    let state = app.player_state();
+    let cells = (state.progress * f64::from(app.hits.progress.width.max(1))).floor() as u16;
+    let lyric = match &app.lyrics {
+        LyricsState::Ready(_, lyrics) => lyrics.current_index(state.elapsed).unwrap_or(usize::MAX),
+        _ => usize::MAX,
+    };
+    (state.elapsed.as_secs(), cells, lyric)
+}
+
 pub async fn run(services: Services) -> Result<(), TuiError> {
     let guard = TerminalGuard::enter()?;
+    let picker = crate::cover::query_picker();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, App::new(services)).await;
+    let mut app = App::new(services);
+    app.cover_picker = picker;
+    let result = run_loop(&mut terminal, app).await;
     drop(terminal);
     drop(guard);
     result
@@ -2641,36 +2705,8 @@ pub(super) async fn run_loop(
                 app.handle_completion();
                 app.refresh_player_state();
             }
-            terminal.draw(|frame| {
-                let status_width = text_width(&player_status(app.player_state()));
-                app.hits = calculate_hits(
-                    LayoutRequest {
-                        area: frame.area(),
-                        column_count: 1 + app.columns.len(),
-                        focus: app.focus,
-                        lyrics_hidden: app.lyrics_hidden,
-                        lyrics_expanded: app.show_lyrics,
-                        content_expanded: app.content_expanded,
-                    },
-                    status_width,
-                    text_width(account_label(&app)),
-                    app.cover_player.is_some() || app.cover_kitty_player.is_some(),
-                );
-                for hit in &mut app.hits.columns {
-                    let selected = if hit.index == 0 {
-                        app.selected
-                    } else {
-                        app.columns
-                            .get(hit.index - 1)
-                            .map_or(0, |column| column.selected)
-                    };
-                    hit.offset = content_offset(selected, hit.area.height);
-                    if hit.index == 0 {
-                        app.hits.content_offset = hit.offset;
-                    }
-                }
-                draw(frame, &mut app);
-            })?;
+            terminal.draw(|frame| paint_frame(frame, &mut app))?;
+            app.progress_stamp = playback_stamp(&app);
             dirty = false;
             next_progress = Instant::now() + PROGRESS_INTERVAL;
         } else if playing && now >= next_progress {
@@ -2681,12 +2717,13 @@ pub(super) async fn run_loop(
                 dirty = true;
                 continue;
             }
-            terminal.draw(|frame| {
-                if let Some(layout) = layout_for(&app, frame.area()) {
-                    draw_player(frame, &mut app, layout.player);
-                }
-            })?;
             next_progress = Instant::now() + PROGRESS_INTERVAL;
+            let stamp = playback_stamp(&app);
+            if stamp == app.progress_stamp {
+                continue;
+            }
+            app.progress_stamp = stamp;
+            terminal.draw(|frame| paint_frame(frame, &mut app))?;
         }
 
         let mut timeout = EVENT_POLL_INTERVAL;

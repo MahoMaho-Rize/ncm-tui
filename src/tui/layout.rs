@@ -61,8 +61,7 @@ pub(super) fn layout_for(app: &App, area: Rect) -> Option<AppLayout> {
         column_count: 1 + app.columns.len(),
         focus: app.focus,
         lyrics_hidden: app.lyrics_hidden,
-        lyrics_expanded: app.show_lyrics,
-        content_expanded: app.content_expanded,
+        expanded: app.expanded,
     })
 }
 
@@ -94,22 +93,35 @@ pub(super) fn app_layout(request: LayoutRequest) -> Option<AppLayout> {
         Focus::Lyrics => column_count - 1,
         _ => 0,
     };
+    let miller_row = rows[1];
+    let player_row = rows[2];
     let nav_width = nav_column_width(area.width);
-    let navigation = Rect::new(rows[1].x, rows[1].y, nav_width, rows[1].height);
+    // L-shell: nav runs through the player row; player is the right arm.
+    let navigation = Rect::new(
+        miller_row.x,
+        miller_row.y,
+        nav_width,
+        miller_row.height.saturating_add(player_row.height),
+    );
+    let player = Rect::new(
+        navigation.right().saturating_sub(1),
+        player_row.y,
+        miller_row.width.saturating_sub(nav_width).saturating_add(1),
+        player_row.height,
+    );
     let workspace = Rect::new(
         navigation.right(),
-        rows[1].y,
-        rows[1].width.saturating_sub(nav_width),
-        rows[1].height,
+        miller_row.y,
+        miller_row.width.saturating_sub(nav_width),
+        miller_row.height,
     );
-    let lyric_width = if request.lyrics_hidden {
+    let lyrics_takes_workspace =
+        request.expanded && !request.lyrics_hidden && request.focus == Focus::Lyrics;
+    let browser_takes_workspace = request.expanded && !lyrics_takes_workspace;
+    let lyric_width = if lyrics_takes_workspace {
+        workspace.width
+    } else if request.lyrics_hidden || browser_takes_workspace {
         0
-    } else if request.lyrics_expanded && request.focus == Focus::Lyrics {
-        let keep = 20.min(workspace.width / 3);
-        workspace
-            .width
-            .saturating_sub(keep)
-            .max(24.min(workspace.width))
     } else if area.width >= WIDE_WIDTH {
         32.min(workspace.width.saturating_sub(24))
     } else {
@@ -122,12 +134,18 @@ pub(super) fn app_layout(request: LayoutRequest) -> Option<AppLayout> {
         workspace.height,
     );
     let lyrics = (lyric_width > 0).then_some(Rect::new(
-        browser_area.right(),
+        if lyrics_takes_workspace {
+            workspace.x
+        } else {
+            browser_area.right()
+        },
         workspace.y,
         lyric_width,
         workspace.height,
     ));
-    let browser = if request.content_expanded || browser_area.width < 24 {
+    let browser = if lyrics_takes_workspace {
+        Vec::new()
+    } else if browser_takes_workspace || browser_area.width < 24 {
         vec![BrowserPane {
             index: active,
             area: browser_area,
@@ -161,7 +179,7 @@ pub(super) fn app_layout(request: LayoutRequest) -> Option<AppLayout> {
         navigation: Some(navigation),
         browser,
         lyrics,
-        player: rows[2],
+        player,
         footer: rows[3],
     })
 }
@@ -199,7 +217,7 @@ pub(super) fn calculate_hits(
             account_width,
             u16::from(request.area.height > 0),
         ),
-        nav: layout.navigation.map(inner_rect).unwrap_or_default(),
+        nav: navigation_hit(layout.navigation, has_cover),
         content,
         columns,
         lyrics: layout.lyrics.map(inner_rect).unwrap_or_default(),
@@ -213,7 +231,7 @@ pub(super) fn calculate_hits(
     }
 }
 
-pub(super) const PLAYER_COVER_COLS: u16 = 6;
+pub(super) const PLAYER_COVER_COLS: u16 = 8;
 pub(super) const NAV_COVER_MIN_ROWS: u16 = 4;
 pub(super) const NAV_COVER_MAX_ROWS: u16 = 12;
 
@@ -225,16 +243,46 @@ pub(super) fn player_cover_width(inner_width: u16, has_cover: bool) -> u16 {
     }
 }
 
-pub(super) fn navigation_cover_rows(inner_height: u16, item_count: usize, has_cover: bool) -> u16 {
-    if !has_cover {
+pub(super) fn navigation_cover_rows(inner_height: u16, column_width: u16, has_cover: bool) -> u16 {
+    if !has_cover || inner_height < 10 || column_width < 8 {
         return 0;
     }
-    let leftover = inner_height.saturating_sub(item_count as u16);
-    if leftover >= NAV_COVER_MIN_ROWS {
-        leftover.min(NAV_COVER_MAX_ROWS)
+    let list_min = 6;
+    let max_rows = inner_height
+        .saturating_sub(list_min)
+        .min(NAV_COVER_MAX_ROWS);
+    // Cell aspect is ~2:1, so a square cover needs width/2 rows. Keep the
+    // slot at least as tall as the player arm so the L-corner is filled.
+    let square = column_width.div_ceil(2).max(NAV_COVER_MIN_ROWS);
+    square.min(max_rows).max(NAV_COVER_MIN_ROWS.min(max_rows))
+}
+
+fn navigation_hit(nav: Option<Rect>, has_cover: bool) -> Rect {
+    let Some(nav) = nav else {
+        return Rect::default();
+    };
+    let inner = inner_rect(nav);
+    let cover = navigation_cover_area(nav, has_cover);
+    let height = if cover.height == 0 {
+        inner.height
     } else {
-        0
+        cover.y.saturating_sub(inner.y)
+    };
+    Rect::new(inner.x, inner.y, inner.width, height)
+}
+
+pub(super) fn navigation_cover_area(nav: Rect, has_cover: bool) -> Rect {
+    let inner = inner_rect(nav);
+    let rows = navigation_cover_rows(inner.height, inner.width, has_cover);
+    if rows == 0 {
+        return Rect::default();
     }
+    Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(rows),
+        inner.width,
+        rows,
+    )
 }
 
 pub(super) fn player_layout(area: Rect, status_width: u16, has_cover: bool) -> PlayerLayout {

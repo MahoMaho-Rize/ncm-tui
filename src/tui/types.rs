@@ -63,8 +63,8 @@ pub(super) const QR_PADDING_X: u16 = 2;
 pub(super) const QR_PADDING_Y: u16 = 1;
 pub(super) const QR_STATUS_GAP: u16 = 1;
 pub(super) const UI_TICK_INTERVAL: Duration = Duration::from_millis(100);
-pub(super) const PROGRESS_INTERVAL: Duration = Duration::from_millis(16);
-pub(super) const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+pub(super) const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
+pub(super) const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const HELP_MAX_SCROLL: u16 = 8;
 pub(super) const LOCAL_IMPORT_HINT: &str = "暂无本地音乐 · 按 I 或点击这里导入";
 pub(super) const TOAST_TTL: Duration = Duration::from_secs(4);
@@ -476,6 +476,7 @@ pub(super) struct TrackRow {
     pub(super) play_count: u64,
     pub(super) format: String,
     pub(super) bytes: u64,
+    pub(super) cover_url: String,
 }
 
 impl From<Track> for TrackRow {
@@ -491,6 +492,7 @@ impl From<Track> for TrackRow {
             play_count: track.play_count,
             format: track.format,
             bytes: track.bytes,
+            cover_url: String::new(),
         }
     }
 }
@@ -508,6 +510,7 @@ impl From<OnlineTrack> for TrackRow {
             play_count: 0,
             format: String::new(),
             bytes: 0,
+            cover_url: track.cover_url,
         }
     }
 }
@@ -710,6 +713,7 @@ pub(super) enum AppEvent {
         result: Result<Loaded, String>,
     },
     LyricsLoaded(u64, Result<Lyrics, String>),
+    CoverLoaded(u64, Vec<u8>),
     DailyWarmed(Vec<OnlineTrack>),
     RecommendedWarmed(Vec<PlaylistSummary>),
     UserPlaylistsWarmed(Vec<PlaylistSummary>),

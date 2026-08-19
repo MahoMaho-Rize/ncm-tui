@@ -55,6 +55,36 @@ use crate::{
 
 use super::*;
 
+pub(super) fn paint_frame(frame: &mut Frame, app: &mut App) {
+    let status_width = text_width(&player_status(app.player_state()));
+    app.hits = calculate_hits(
+        LayoutRequest {
+            area: frame.area(),
+            column_count: 1 + app.columns.len(),
+            focus: app.focus,
+            lyrics_hidden: app.lyrics_hidden,
+            expanded: app.expanded,
+        },
+        status_width,
+        text_width(account_label(app)),
+        app.cover_bytes.is_some() || app.cover_protocol_nav.is_some() || app.cover_nav.is_some(),
+    );
+    for hit in &mut app.hits.columns {
+        let selected = if hit.index == 0 {
+            app.selected
+        } else {
+            app.columns
+                .get(hit.index - 1)
+                .map_or(0, |column| column.selected)
+        };
+        hit.offset = content_offset(selected, hit.area.height);
+        if hit.index == 0 {
+            app.hits.content_offset = hit.offset;
+        }
+    }
+    draw(frame, app);
+}
+
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(
@@ -66,9 +96,6 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         return;
     };
     draw_header(frame, app, layout.header);
-    if let Some(navigation) = layout.navigation {
-        draw_navigation(frame, app, navigation);
-    }
     for pane in &layout.browser {
         if pane.index == 0 {
             draw_content(frame, app, pane.area);
@@ -79,7 +106,15 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(lyrics) = layout.lyrics {
         draw_lyrics(frame, app, lyrics);
     }
+    if let Some(navigation) = layout.navigation {
+        draw_navigation(frame, app, navigation);
+    }
     draw_player(frame, app, layout.player);
+    if let Some(navigation) = layout.navigation {
+        join_nav_player_frame(frame, app, navigation, layout.player);
+        // Cover last so the player chrome cannot wipe Kitty placeholders.
+        draw_cover_slot(frame, app, navigation);
+    }
     draw_footer(frame, app, layout.footer);
     if app.show_help {
         draw_help(frame, app, area);
@@ -147,7 +182,16 @@ pub(super) fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
-    let grouped = grouped_navigation(area.height.saturating_sub(2));
+    let inner = inner_rect(area);
+    let has_cover =
+        app.cover_bytes.is_some() || app.cover_protocol_nav.is_some() || app.cover_nav.is_some();
+    let cover = navigation_cover_area(area, has_cover);
+    let list_height = if cover.height == 0 {
+        inner.height
+    } else {
+        cover.y.saturating_sub(inner.y)
+    };
+    let grouped = grouped_navigation(list_height);
     let mut previous = "";
     let mut items = Vec::new();
     for (index, route) in Route::ALL.iter().enumerate() {
@@ -186,37 +230,8 @@ pub(super) fn draw_navigation(frame: &mut Frame, app: &mut App, area: Rect) {
         ))));
     }
     frame.render_widget(panel(app, " 音乐 ", app.focus == Focus::Navigation), area);
-    let inner = inner_rect(area);
-    let cover_rows = navigation_cover_rows(inner.height, items.len(), app.cover_bytes.is_some());
-    let list_area = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(cover_rows),
-    );
+    let list_area = Rect::new(inner.x, inner.y, inner.width, list_height);
     frame.render_widget(List::new(items), list_area);
-    if cover_rows > 0 {
-        let cols = inner.width.min(cover_rows.saturating_mul(2)).max(1);
-        let cover_area = Rect::new(
-            inner.x + inner.width.saturating_sub(cols) / 2,
-            inner.bottom().saturating_sub(cover_rows),
-            cols.min(inner.width),
-            cover_rows,
-        );
-        if let Some(protocol) = app.cover_kitty_nav.as_mut() {
-            crate::cover::render_kitty(frame, cover_area, protocol);
-        } else if let Some(bytes) = app.cover_bytes.as_deref()
-            && let Some(cover) = crate::cover::fit(bytes, inner.width, cover_rows)
-        {
-            let cover_area = Rect::new(
-                inner.x + inner.width.saturating_sub(cover.cols) / 2,
-                inner.bottom().saturating_sub(cover_rows),
-                cover.cols.min(inner.width),
-                cover_rows,
-            );
-            frame.render_widget(Paragraph::new(cover.lines), cover_area);
-        }
-    }
 }
 
 pub(super) fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
@@ -674,52 +689,26 @@ pub(super) fn draw_tracks(
     focused: bool,
     page: PaginationInfo,
 ) {
+    if app.expanded {
+        draw_expanded_tracks(frame, app, area, tracks, title, selected, focused, page);
+        return;
+    }
     let visible = inner_rect(area).height as usize;
     let offset = content_offset(selected, visible as u16);
-    let expanded = app.content_expanded;
     let items = tracks
         .iter()
         .skip(offset)
         .take(visible)
         .map(|track| {
-            let lead = if app.current == Some(track.id) {
-                "▶"
-            } else if track.favorite {
-                "♥"
-            } else {
-                " "
-            };
-            let line = if expanded {
-                Line::from(vec![
-                    Span::styled(format!(" {lead}  "), Style::default().fg(app.theme.accent)),
-                    Span::raw(shorten(&track.title, 28)),
-                    Span::styled(
-                        format!("  {}", shorten(&track.artists, 20)),
-                        Style::default().fg(app.theme.muted),
-                    ),
-                    Span::styled(
-                        format!("  {}", shorten(&track.album, 20)),
-                        Style::default().fg(app.theme.muted),
-                    ),
-                    Span::styled(
-                        format!(
-                            "  {}",
-                            format_time(Duration::from_millis(track.duration_ms))
-                        ),
-                        Style::default().fg(app.theme.muted),
-                    ),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(format!(" {lead}  "), Style::default().fg(app.theme.accent)),
-                    Span::raw(shorten(&track.title, 28)),
-                    Span::styled(
-                        format!("  {}", shorten(&track.artists, 22)),
-                        Style::default().fg(app.theme.muted),
-                    ),
-                ])
-            };
-            ListItem::new(line)
+            let lead = track_lead(app, track);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {lead}  "), Style::default().fg(app.theme.accent)),
+                Span::raw(shorten(&track.title, 28)),
+                Span::styled(
+                    format!("  {}", shorten(&track.artists, 22)),
+                    Style::default().fg(app.theme.muted),
+                ),
+            ]))
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default()
@@ -730,6 +719,137 @@ pub(super) fn draw_tracks(
             .block(panel(app, &title, focused))
             .highlight_style(selection_style(app, focused)),
         area,
+        &mut state,
+    );
+    render_scrollbar(frame, app, area, tracks.len(), selected);
+}
+
+fn track_lead(app: &App, track: &TrackRow) -> &'static str {
+    if app.current == Some(track.id) {
+        "▶"
+    } else if track.favorite {
+        "♥"
+    } else {
+        " "
+    }
+}
+
+pub(super) fn clip_cell(value: &str, width: u16) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text_width(value) <= width {
+        let pad = width.saturating_sub(text_width(value));
+        return format!("{value}{}", " ".repeat(pad as usize));
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut kept = String::new();
+    for character in value.chars() {
+        let candidate = format!("{kept}{character}");
+        if text_width(&candidate) + 1 > width {
+            break;
+        }
+        kept = candidate;
+    }
+    let clipped = format!("{kept}…");
+    let pad = width.saturating_sub(text_width(&clipped));
+    format!("{clipped}{}", " ".repeat(pad as usize))
+}
+
+fn track_column_widths(inner_width: u16) -> (u16, u16, u16, u16) {
+    let duration = 5;
+    let gaps = 3;
+    let rest = inner_width.saturating_sub(3 + duration + gaps).max(12);
+    let title = (rest * 4 / 10).max(6);
+    let artist = (rest * 3 / 10).max(4);
+    let album = rest.saturating_sub(title + artist).max(4);
+    (title, artist, album, duration)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_expanded_tracks(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    tracks: &[TrackRow],
+    title: &str,
+    selected: usize,
+    focused: bool,
+    page: PaginationInfo,
+) {
+    frame.render_widget(
+        panel(
+            app,
+            &title_with_page(title, selected, tracks.len(), page),
+            focused,
+        ),
+        area,
+    );
+    let inner = inner_rect(area);
+    if inner.width < 20 || inner.height < 2 {
+        return;
+    }
+    let (title_w, artist_w, album_w, duration_w) = track_column_widths(inner.width);
+    let header_style = Style::default()
+        .fg(app.theme.muted)
+        .add_modifier(Modifier::BOLD);
+    let header = Line::from(vec![
+        Span::raw("   "),
+        Span::styled(clip_cell("歌名", title_w), header_style),
+        Span::raw(" "),
+        Span::styled(clip_cell("歌手", artist_w), header_style),
+        Span::raw(" "),
+        Span::styled(clip_cell("专辑", album_w), header_style),
+        Span::raw(" "),
+        Span::styled(clip_cell("时长", duration_w), header_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let list_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let visible = list_area.height as usize;
+    let offset = content_offset(selected, list_area.height);
+    let items = tracks
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|track| {
+            let lead = track_lead(app, track);
+            let duration = format_time(Duration::from_millis(track.duration_ms));
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {lead} "), Style::default().fg(app.theme.accent)),
+                Span::raw(clip_cell(&track.title, title_w)),
+                Span::raw(" "),
+                Span::styled(
+                    clip_cell(&track.artists, artist_w),
+                    Style::default().fg(app.theme.muted),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    clip_cell(&track.album, album_w),
+                    Style::default().fg(app.theme.muted),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    clip_cell(&duration, duration_w),
+                    Style::default().fg(app.theme.muted),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default()
+        .with_selected((!tracks.is_empty()).then_some(selected.saturating_sub(offset)));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(selection_style(app, focused)),
+        list_area,
         &mut state,
     );
     render_scrollbar(frame, app, area, tracks.len(), selected);
@@ -1093,8 +1213,7 @@ pub(super) fn draw_downloads(frame: &mut Frame, app: &App, area: Rect) {
 pub(super) fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
     let state = app.player_state.clone();
     let status = player_status(&state);
-    let has_cover = app.cover_player.is_some() || app.cover_kitty_player.is_some();
-    let layout = player_layout(area, text_width(&status), has_cover);
+    let layout = player_layout(area, text_width(&status), false);
     let icon = if state.title.is_empty() {
         "■"
     } else if state.paused {
@@ -1120,19 +1239,6 @@ pub(super) fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|track| track.album.clone())
         .unwrap_or_default();
     frame.render_widget(panel(app, " 播放器 ", false), area);
-    if layout.cover.width > 0 {
-        if let Some(protocol) = app.cover_kitty_player.as_mut() {
-            crate::cover::render_kitty(frame, layout.cover, protocol);
-        } else if let Some(cover) = app.cover_player.as_ref() {
-            let lines = cover
-                .lines
-                .iter()
-                .take(layout.cover.height as usize)
-                .cloned()
-                .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(lines), layout.cover);
-        }
-    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1269,7 +1375,7 @@ pub(super) fn context_actions(app: &App) -> Vec<UiAction> {
         }
         _ => {}
     }
-    if matches!(app.focus, Focus::Content | Focus::Column(_)) || app.content_expanded {
+    if !matches!(app.focus, Focus::Navigation) || app.expanded {
         actions.push(UiAction::Expand);
     }
     actions.push(UiAction::ToggleHelp);
@@ -1284,7 +1390,7 @@ pub(super) fn format_action_hint(action: UiAction) -> String {
 pub(super) fn format_context_action_hint(app: &App, action: UiAction) -> String {
     if app.route == Route::Local && action == UiAction::Refresh {
         "r 扫描".into()
-    } else if action == UiAction::Expand && app.content_expanded {
+    } else if action == UiAction::Expand && app.expanded {
         "e 收起".into()
     } else {
         format_action_hint(action)
@@ -1454,8 +1560,8 @@ pub(super) fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 UiAction::ToggleFavorite,
                 UiAction::Details,
             ])),
-            Line::from("l 聚焦并放大歌词，再按恢复 · h 彻底关闭/打开歌词栏 · [/] 快退/快进"),
-            Line::from("e 展开歌单/曲目栏（切页保持展开）· 再按回到分栏 · 左栏和播放栏始终固定"),
+            Line::from("l 聚焦歌词栏 · e 展开当前栏（歌单/曲目/歌词）占满中间区域 · 再按收起"),
+            Line::from("h 彻底关闭/打开歌词栏 · [/] 快退/快进"),
             Line::from("音量处滚轮调节；进度轨道可点击"),
             Line::from(""),
             Line::from(Span::styled(
@@ -1623,6 +1729,114 @@ pub(super) fn draw_details_overlay(frame: &mut Frame, app: &App, area: Rect) {
         .block(overlay_panel(app, " 歌曲详情 ")),
         popup,
     );
+}
+
+fn draw_cover_slot(frame: &mut Frame, app: &mut App, nav: Rect) {
+    let has_cover =
+        app.cover_bytes.is_some() || app.cover_protocol_nav.is_some() || app.cover_nav.is_some();
+    let cover_area = navigation_cover_area(nav, has_cover);
+    if cover_area.width == 0 || cover_area.height == 0 {
+        return;
+    }
+    draw_navigation_cover(frame, app, cover_area);
+}
+
+fn draw_navigation_cover(frame: &mut Frame, app: &mut App, cover_area: Rect) {
+    // Graphics protocol only when the picker actually selected Kitty/Sixel.
+    // Never paint another widget under it — that wipes unicode placeholders.
+    if crate::cover::uses_terminal_graphics(&app.cover_picker)
+        && let Some(protocol) = app.cover_protocol_nav.as_mut()
+    {
+        crate::cover::render_protocol(frame, cover_area, protocol);
+        return;
+    }
+    if app
+        .cover_nav
+        .as_ref()
+        .is_none_or(|cover| cover.cols != cover_area.width || cover.rows != cover_area.height)
+        && let Some(bytes) = app.cover_bytes.as_deref()
+    {
+        app.cover_nav = crate::cover::from_bytes(bytes, cover_area.width, cover_area.height);
+    }
+    let Some(cover) = app.cover_nav.as_ref() else {
+        return;
+    };
+    let lines = cover
+        .lines
+        .iter()
+        .take(cover_area.height as usize)
+        .cloned()
+        .map(|line| {
+            let spans = line
+                .spans
+                .into_iter()
+                .take(cover_area.width as usize)
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), cover_area);
+}
+
+/// Fuse nav + player into an L: ├ at the inner corner, ┴ at the outer heel.
+fn join_nav_player_frame(frame: &mut Frame, app: &App, nav: Rect, player: Rect) {
+    if nav.width == 0 || player.width == 0 || player.height == 0 {
+        return;
+    }
+    let shared = if player.x + 1 == nav.right() {
+        player.x
+    } else if player.x == nav.right() {
+        nav.right().saturating_sub(1)
+    } else {
+        return;
+    };
+    let style = Style::default().fg(if app.focus == Focus::Navigation {
+        app.theme.accent
+    } else {
+        app.theme.border
+    });
+    let top = player.y;
+    let bottom = player.bottom().saturating_sub(1);
+    if bottom < top {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    set_border_symbol(
+        buf,
+        shared,
+        top,
+        ratatui::symbols::line::NORMAL.vertical_right,
+        style,
+    );
+    set_border_symbol(
+        buf,
+        shared,
+        bottom,
+        ratatui::symbols::line::NORMAL.horizontal_up,
+        style,
+    );
+    for y in (top + 1)..bottom {
+        set_border_symbol(
+            buf,
+            shared,
+            y,
+            ratatui::symbols::line::NORMAL.vertical,
+            style,
+        );
+    }
+}
+
+fn set_border_symbol(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    symbol: &str,
+    style: Style,
+) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_symbol(symbol);
+        cell.set_style(style);
+    }
 }
 
 pub(super) fn panel<'a>(app: &App, title: &'a str, focused: bool) -> Block<'a> {

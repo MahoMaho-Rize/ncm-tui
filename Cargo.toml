@@ -29,7 +29,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
 url = "2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 ratatui-image = { version = "8.0.1", default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]

@@ -310,6 +310,10 @@ impl Library {
         Ok(self.inner.record_play(track_id)?)
     }
 
+    pub fn set_cover_url(&self, track_id: u64, cover_url: &str) -> Result<bool> {
+        Ok(self.inner.set_cover_url(track_id, cover_url)?)
+    }
+
     pub fn organize_track(&self, track_id: u64) -> Result<Option<MoveOutcome>> {
         let Some(track) = self.inner.organizable_track(track_id)? else {
             return Ok(None);
@@ -346,6 +350,10 @@ impl Library {
     }
 }
 
+pub fn is_catalog_id(id: u64) -> bool {
+    id > 0 && id < 4_000_000_000_000_000_000
+}
+
 fn map_tracks(tracks: Vec<LibraryTrack>) -> Vec<Track> {
     tracks
         .into_iter()
@@ -371,6 +379,13 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn catalog_ids_exclude_local_import_range() {
+        assert!(is_catalog_id(186016));
+        assert!(!is_catalog_id(0));
+        assert!(!is_catalog_id(4_000_000_000_000_000_000));
+    }
 
     #[test]
     fn scan_is_incremental_and_marks_removed_files_missing() {

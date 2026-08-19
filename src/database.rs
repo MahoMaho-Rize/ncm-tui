@@ -880,6 +880,14 @@ impl LibraryDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn set_cover_url(&self, track_id: u64, cover_url: &str) -> Result<bool> {
+        let changed = self.lock()?.execute(
+            "UPDATE tracks SET cover_url=?1, updated_at=?2 WHERE ncm_id=?3",
+            params![cover_url, unix_timestamp(), track_id as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn track_detail(&self, track_id: u64) -> Result<Option<TrackDetail>> {
         let connection = self.lock()?;
         connection

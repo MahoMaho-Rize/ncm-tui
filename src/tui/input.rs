@@ -257,7 +257,7 @@ pub(super) fn dispatch_action(app: &mut App, action: UiAction) -> bool {
             app.input_cursor = 0;
         }
         UiAction::ToggleLyrics => app.toggle_lyrics_focus(),
-        UiAction::Expand => app.toggle_content_expand(),
+        UiAction::Expand => app.toggle_expand(),
         UiAction::TogglePause => {
             if let Some(player) = &mut app.player {
                 player.toggle_pause();
@@ -415,7 +415,6 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     app.previous_focus = app.valid_focus(app.focus);
                 }
                 app.focus = Focus::Lyrics;
-                app.show_lyrics = false;
             } else if let Some(hit) = app
                 .hits
                 .columns
@@ -684,6 +683,5 @@ pub(super) struct LayoutRequest {
     pub(super) column_count: usize,
     pub(super) focus: Focus,
     pub(super) lyrics_hidden: bool,
-    pub(super) lyrics_expanded: bool,
-    pub(super) content_expanded: bool,
+    pub(super) expanded: bool,
 }

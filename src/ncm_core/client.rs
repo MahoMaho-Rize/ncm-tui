@@ -317,7 +317,7 @@ impl NcmClient {
 
     /// Fetches a small binary asset, such as album artwork.
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url).header(REFERER, HOST).send().await?;
         if !response.status().is_success() {
             return Err(NcmError::DownloadStatus {
                 status: response.status(),

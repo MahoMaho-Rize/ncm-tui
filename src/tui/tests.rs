@@ -86,15 +86,14 @@ fn layout_req(
     column_count: usize,
     focus: Focus,
     lyrics_hidden: bool,
-    lyrics_expanded: bool,
+    expanded: bool,
 ) -> LayoutRequest {
     LayoutRequest {
         area,
         column_count,
         focus,
         lyrics_hidden,
-        lyrics_expanded,
-        content_expanded: false,
+        expanded,
     }
 }
 
@@ -103,10 +102,10 @@ fn hits_for(
     column_count: usize,
     focus: Focus,
     lyrics_hidden: bool,
-    lyrics_expanded: bool,
+    expanded: bool,
 ) -> HitRegions {
     calculate_hits(
-        layout_req(area, column_count, focus, lyrics_hidden, lyrics_expanded),
+        layout_req(area, column_count, focus, lyrics_hidden, expanded),
         16,
         6,
         false,
@@ -207,6 +206,7 @@ fn warmed_playlist_tracks_open_without_an_async_column_task() {
                 artists: "Artist".into(),
                 album: "Album".into(),
                 duration_ms: 180_000,
+                cover_url: String::new(),
             }],
         ),
     );
@@ -233,6 +233,7 @@ fn warmed_primary_routes_open_without_an_async_load() {
         artists: "Artist".into(),
         album: "Album".into(),
         duration_ms: 180_000,
+        cover_url: "https://p1.music.126.net/cover.jpg".into(),
     };
     app.daily_cache = Some(vec![track.clone()]);
     app.recommended_cache = Some(vec![PlaylistSummary {
@@ -281,6 +282,18 @@ fn cache_only_events_do_not_request_a_redraw() {
     assert!(app.recommended_cache.is_some());
     assert!(app.playlist_cache.is_some());
     assert!(app.listening_week_cache.is_some());
+}
+
+#[test]
+fn playback_stamp_changes_with_elapsed_seconds_and_lyric_line() {
+    let (_directory, mut app) = test_app();
+    app.hits.progress = Rect::new(0, 0, 40, 1);
+    app.player_state.elapsed = Duration::from_millis(900);
+    app.player_state.progress = 0.1;
+    let first = playback_stamp(&app);
+    app.player_state.elapsed = Duration::from_millis(1_100);
+    app.player_state.progress = 0.1;
+    assert_ne!(first, playback_stamp(&app));
 }
 
 #[test]
@@ -381,6 +394,8 @@ fn compact_layout_keeps_navigation_and_player() {
         assert_eq!(layout.player.y, 18);
         assert!(hits.nav.x >= 1);
         assert!(hits.content.x >= nav.right());
+        assert_eq!(nav.bottom(), layout.player.bottom());
+        assert_eq!(layout.player.x, nav.right().saturating_sub(1));
     }
 }
 
@@ -436,29 +451,27 @@ fn compact_lyrics_focus_keeps_navigation_and_player() {
     let lyrics = layout.lyrics.unwrap();
     assert_eq!(nav.x, 0);
     assert_eq!(layout.player.y, 18);
-    assert!(lyrics.x >= nav.right());
-    assert!(
-        layout
-            .browser
-            .iter()
-            .all(|pane| pane.area.right() <= lyrics.x)
-    );
+    assert!(layout.browser.is_empty());
+    assert_eq!(lyrics.x, nav.right());
+    assert_eq!(lyrics.right(), 60);
 }
 
 #[test]
 fn expanded_browser_keeps_navigation_and_player_fixed() {
     let area = Rect::new(0, 0, 160, 30);
     let miller = app_layout(layout_req(area, 3, Focus::Column(0), false, false)).unwrap();
-    let expanded = app_layout(LayoutRequest {
-        content_expanded: true,
-        ..layout_req(area, 3, Focus::Column(0), false, false)
-    })
-    .unwrap();
+    let expanded = app_layout(layout_req(area, 3, Focus::Column(0), false, true)).unwrap();
     assert_eq!(miller.navigation, expanded.navigation);
     assert_eq!(miller.player, expanded.player);
+    assert!(miller.lyrics.is_some());
+    assert!(expanded.lyrics.is_none());
     assert!(miller.browser.len() > 1);
     assert_eq!(expanded.browser.len(), 1);
-    assert!(expanded.browser[0].area.width > miller.browser[0].area.width);
+    assert_eq!(
+        expanded.browser[0].area.x,
+        expanded.navigation.unwrap().right()
+    );
+    assert_eq!(expanded.browser[0].area.right(), area.right());
 }
 
 #[test]
@@ -498,7 +511,7 @@ fn player_controls_have_disjoint_hit_regions() {
 #[test]
 fn player_cover_sits_left_and_does_not_overlap_controls() {
     let layout = player_layout(Rect::new(0, 0, 96, 5), 18, true);
-    assert_eq!(layout.cover, Rect::new(1, 1, 6, 3));
+    assert_eq!(layout.cover, Rect::new(1, 1, 8, 3));
     assert_eq!(layout.song_info.x, layout.cover.right() + 1);
     for region in [
         layout.song_info,
@@ -520,12 +533,108 @@ fn player_cover_sits_left_and_does_not_overlap_controls() {
 }
 
 #[test]
-fn navigation_cover_only_uses_leftover_rows() {
-    assert_eq!(navigation_cover_rows(14, 14, true), 0);
-    assert_eq!(navigation_cover_rows(20, 14, true), 6);
-    assert_eq!(navigation_cover_rows(40, 19, true), 12);
-    assert_eq!(navigation_cover_rows(20, 14, false), 0);
-    assert_eq!(navigation_cover_rows(17, 14, true), 0);
+fn navigation_cover_reserves_a_square_slot() {
+    assert_eq!(navigation_cover_rows(14, 18, true), 8);
+    assert_eq!(navigation_cover_rows(20, 22, true), 11);
+    assert_eq!(navigation_cover_rows(40, 24, true), 12);
+    assert_eq!(navigation_cover_rows(20, 22, false), 0);
+    assert_eq!(navigation_cover_rows(9, 18, true), 0);
+}
+
+#[test]
+fn cover_slot_sits_in_the_l_corner_next_to_the_player() {
+    let layout = app_layout(layout_req(
+        Rect::new(0, 0, 96, 24),
+        1,
+        Focus::Content,
+        false,
+        false,
+    ))
+    .unwrap();
+    let nav = layout.navigation.unwrap();
+    let inner = inner_rect(nav);
+    let cover = navigation_cover_area(nav, true);
+    assert_eq!(cover.x, inner.x);
+    assert_eq!(cover.width, inner.width);
+    assert_eq!(cover.bottom(), inner.bottom());
+    assert!(cover.right() <= layout.player.x);
+    assert!(cover.height >= NAV_COVER_MIN_ROWS, "{cover:?}");
+    assert!(
+        cover.y < layout.player.bottom() && cover.bottom() > layout.player.y,
+        "cover {cover:?} should sit in the left column beside the player {:?}",
+        layout.player
+    );
+}
+
+#[test]
+fn navigation_draws_half_block_cover_at_the_bottom() {
+    use image::ImageEncoder;
+    let (_directory, mut app) = test_app();
+    let png = {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(
+                &[200, 40, 80, 10, 180, 90],
+                1,
+                2,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    };
+    app.cover_bytes = Some(png.clone());
+    app.cover_nav = crate::cover::from_bytes(&png, 22, 8);
+    let (screen, _) = render_app(&mut app, 96, 24);
+    assert!(
+        screen.contains('▀'),
+        "left-column cover should paint half-blocks:\n{screen}"
+    );
+    let player_line = screen.lines().nth(19).unwrap_or("");
+    assert!(
+        player_line.contains('▀'),
+        "cover should sit to the left of the player:\n{player_line}"
+    );
+}
+
+#[tokio::test]
+async fn load_covers_always_starts_a_fetch_when_no_embedded_art() {
+    let (_directory, mut app) = test_app();
+    let track = test_track(99);
+    app.load_covers(&track, None);
+    assert!(
+        app.cover_task.is_some(),
+        "missing library cover_url must still ask song/detail"
+    );
+    assert_eq!(app.cover_track, Some(99));
+}
+
+#[tokio::test]
+async fn load_covers_uses_the_track_pic_url_without_waiting_for_the_library() {
+    let (_directory, mut app) = test_app();
+    let mut track = test_track(7);
+    track.cover_url = "https://p1.music.126.net/cover.jpg".into();
+    app.load_covers(&track, None);
+    assert!(app.cover_task.is_some());
+}
+
+#[test]
+fn nav_and_player_share_an_l_frame() {
+    let area = Rect::new(0, 0, 96, 24);
+    let layout = app_layout(layout_req(area, 1, Focus::Content, false, false)).unwrap();
+    let nav = layout.navigation.unwrap();
+    assert_eq!(nav.x, 0);
+    assert_eq!(nav.bottom(), layout.player.bottom());
+    assert_eq!(layout.player.x, nav.right().saturating_sub(1));
+    assert!(layout.browser[0].area.x >= nav.right());
+    assert!(layout.browser[0].area.bottom() <= layout.player.y);
+
+    let (_directory, mut app) = test_app();
+    let (screen, _) = render_app(&mut app, 96, 24);
+    assert!(
+        screen.contains('├'),
+        "L inner corner should be ├ :\n{screen}"
+    );
+    assert!(screen.contains('┴'), "L outer heel should be ┴ :\n{screen}");
 }
 
 #[test]
@@ -762,13 +871,19 @@ async fn lyrics_focus_expands_without_changing_browser_state() {
 
     app.toggle_lyrics_focus();
     assert_eq!(app.focus, Focus::Lyrics);
-    assert!(app.show_lyrics);
+    assert!(!app.expanded);
     assert_eq!(app.selected, 1);
     assert_eq!(app.columns[0].selected, 1);
 
-    app.toggle_lyrics_focus();
-    assert_eq!(app.focus, Focus::Column(0));
-    assert!(!app.show_lyrics);
+    app.toggle_expand();
+    assert!(app.expanded);
+    assert_eq!(app.focus, Focus::Lyrics);
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.columns[0].selected, 1);
+
+    app.toggle_expand();
+    assert!(!app.expanded);
+    assert_eq!(app.focus, Focus::Lyrics);
     assert_eq!(app.selected, 1);
     assert_eq!(app.columns[0].selected, 1);
 }
@@ -848,27 +963,53 @@ async fn compact_navigation_stays_visible_without_covering_player() {
 }
 
 #[tokio::test]
-async fn expand_survives_route_change_and_shows_album_duration() {
+async fn expand_survives_route_change_and_fills_workspace() {
     let (_directory, mut app) = test_app();
     app.focus = Focus::Content;
     app.content = Content::Tracks(vec![test_track(1)]);
-    app.toggle_content_expand();
-    assert!(app.content_expanded);
+    app.toggle_expand();
+    assert!(app.expanded);
     app.set_route(Route::Daily);
-    assert!(app.content_expanded);
+    assert!(app.expanded);
     assert_eq!(app.route, Route::Daily);
+    let expanded = app_layout(layout_req(
+        Rect::new(0, 0, 96, 24),
+        1,
+        Focus::Content,
+        false,
+        true,
+    ))
+    .unwrap();
+    assert!(expanded.lyrics.is_none());
+    assert_eq!(expanded.browser.len(), 1);
+    assert_eq!(
+        expanded.browser[0].area.width,
+        96 - expanded.navigation.unwrap().width
+    );
+    app.toggle_expand();
+    assert!(!app.expanded);
+}
+
+#[test]
+fn clip_cell_pads_and_ellipsizes_by_display_width() {
+    assert_eq!(clip_cell("ab", 4), "ab  ");
+    assert_eq!(clip_cell("你好世界", 5), "你好…");
+    assert_eq!(text_width(&clip_cell("超长标题不会换行", 6)), 6);
+}
+
+#[test]
+fn expanded_track_table_renders_headers() {
+    let (_directory, mut app) = test_app();
+    app.focus = Focus::Content;
+    app.expanded = true;
     app.content = Content::Tracks(vec![test_track(1)]);
-    let (expanded, _) = render_app(&mut app, 96, 24);
-    assert!(expanded.contains("Album"));
-    assert!(expanded.contains("3:00"));
-    app.toggle_content_expand();
-    assert!(!app.content_expanded);
-    app.content = Content::Tracks(vec![test_track(1)]);
-    let (miller, _) = render_app(&mut app, 96, 24);
-    assert!(!miller.contains("Album"));
-    assert!(!miller.contains("3:00"));
-    assert!(miller.contains("Song 1"));
-    assert!(miller.contains("Artist"));
+    let (screen, _) = render_app(&mut app, 96, 24);
+    let compact = screen.replace(' ', "");
+    assert!(compact.contains("歌名"));
+    assert!(compact.contains("歌手"));
+    assert!(compact.contains("专辑"));
+    assert!(compact.contains("时长"));
+    assert!(compact.contains("Song1"));
 }
 
 #[tokio::test]
@@ -920,6 +1061,7 @@ async fn offline_daily_route_uses_warm_cache() {
         artists: "Artist".into(),
         album: "Album".into(),
         duration_ms: 180_000,
+        cover_url: String::new(),
     }]);
     app.load_daily();
     assert!(matches!(app.content, Content::Tracks(ref tracks) if tracks.len() == 1));
@@ -1152,6 +1294,7 @@ fn test_track(id: u64) -> TrackRow {
         play_count: 0,
         format: String::new(),
         bytes: 0,
+        cover_url: String::new(),
     }
 }
 
