@@ -104,9 +104,9 @@ pub(super) fn app_layout(request: LayoutRequest) -> Option<AppLayout> {
         miller_row.height.saturating_add(player_row.height),
     );
     let player = Rect::new(
-        navigation.right().saturating_sub(1),
+        navigation.right(),
         player_row.y,
-        miller_row.width.saturating_sub(nav_width).saturating_add(1),
+        miller_row.width.saturating_sub(nav_width),
         player_row.height,
     );
     let workspace = Rect::new(
@@ -193,7 +193,7 @@ pub(super) fn calculate_hits(
     let Some(layout) = app_layout(request) else {
         return HitRegions::default();
     };
-    let player = player_layout(layout.player, player_status_width, has_cover);
+    let player = player_layout(layout.player, player_status_width, has_cover, true);
     let columns = layout
         .browser
         .iter()
@@ -277,6 +277,8 @@ pub(super) fn navigation_cover_area(nav: Rect, has_cover: bool) -> Rect {
     if rows == 0 {
         return Rect::default();
     }
+    // Stay inside the left-column frame. Painting on the border cells lets
+    // Kitty graphics overflow the box because they are not clipped to glyphs.
     Rect::new(
         inner.x,
         inner.bottom().saturating_sub(rows),
@@ -285,8 +287,17 @@ pub(super) fn navigation_cover_area(nav: Rect, has_cover: bool) -> Rect {
     )
 }
 
-pub(super) fn player_layout(area: Rect, status_width: u16, has_cover: bool) -> PlayerLayout {
-    let inner = inner_rect(area);
+pub(super) fn player_layout(
+    area: Rect,
+    status_width: u16,
+    has_cover: bool,
+    open_left: bool,
+) -> PlayerLayout {
+    let inner = if open_left {
+        inner_rect_open_left(area)
+    } else {
+        inner_rect(area)
+    };
     if inner.width < 24 || inner.height < 3 {
         return PlayerLayout::default();
     }
@@ -360,6 +371,15 @@ pub(super) fn player_layout(area: Rect, status_width: u16, has_cover: bool) -> P
         volume,
         cover,
     }
+}
+
+pub(super) fn inner_rect_open_left(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(2),
+    )
 }
 
 pub(super) fn inner_rect(area: Rect) -> Rect {

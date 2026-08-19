@@ -132,7 +132,6 @@ pub(super) struct App {
     pub(super) cover_protocol_nav: Option<ratatui_image::protocol::StatefulProtocol>,
     pub(super) cover_track: Option<u64>,
     pub(super) cover_task: Option<JoinHandle<()>>,
-    pub(super) progress_stamp: (u64, u16, usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,7 +231,6 @@ impl App {
             cover_protocol_nav: None,
             cover_track: None,
             cover_task: None,
-            progress_stamp: (u64::MAX, 0, usize::MAX),
         };
         app.load_local();
         #[cfg(not(test))]
@@ -2657,16 +2655,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub(super) fn playback_stamp(app: &App) -> (u64, u16, usize) {
-    let state = app.player_state();
-    let cells = (state.progress * f64::from(app.hits.progress.width.max(1))).floor() as u16;
-    let lyric = match &app.lyrics {
-        LyricsState::Ready(_, lyrics) => lyrics.current_index(state.elapsed).unwrap_or(usize::MAX),
-        _ => usize::MAX,
-    };
-    (state.elapsed.as_secs(), cells, lyric)
-}
-
 pub async fn run(services: Services) -> Result<(), TuiError> {
     let guard = TerminalGuard::enter()?;
     let picker = crate::cover::query_picker();
@@ -2699,31 +2687,17 @@ pub(super) async fn run_loop(
         }
 
         let playing = app.needs_progress_tick();
-        if dirty {
+        // pigma: wait for events, then paint a full frame. Progress arrives
+        // about every 200ms; we never clone the back buffer or overlay patches.
+        if dirty || (playing && now >= next_progress) {
             app.refresh_player_state();
             if app.playback_finished() {
                 app.handle_completion();
                 app.refresh_player_state();
             }
             terminal.draw(|frame| paint_frame(frame, &mut app))?;
-            app.progress_stamp = playback_stamp(&app);
             dirty = false;
             next_progress = Instant::now() + PROGRESS_INTERVAL;
-        } else if playing && now >= next_progress {
-            app.refresh_player_state();
-            if app.playback_finished() {
-                app.handle_completion();
-                app.refresh_player_state();
-                dirty = true;
-                continue;
-            }
-            next_progress = Instant::now() + PROGRESS_INTERVAL;
-            let stamp = playback_stamp(&app);
-            if stamp == app.progress_stamp {
-                continue;
-            }
-            app.progress_stamp = stamp;
-            terminal.draw(|frame| paint_frame(frame, &mut app))?;
         }
 
         let mut timeout = EVENT_POLL_INTERVAL;

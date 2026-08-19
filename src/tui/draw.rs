@@ -111,7 +111,6 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_player(frame, app, layout.player);
     if let Some(navigation) = layout.navigation {
-        join_nav_player_frame(frame, app, navigation, layout.player);
         // Cover last so the player chrome cannot wipe Kitty placeholders.
         draw_cover_slot(frame, app, navigation);
     }
@@ -1210,10 +1209,37 @@ pub(super) fn draw_downloads(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn draw_player_clock(
+    frame: &mut Frame,
+    app: &App,
+    layout: &PlayerLayout,
+    state: &crate::player::PlayerState,
+) {
+    frame.render_widget(
+        LineGauge::default()
+            .filled_style(Style::default().fg(app.theme.accent))
+            .unfilled_style(Style::default().fg(app.theme.panel_highlight))
+            .line_set(ratatui::symbols::line::NORMAL)
+            .ratio(state.progress)
+            .label(""),
+        layout.progress,
+    );
+    frame.render_widget(
+        Paragraph::new(format_time(state.elapsed))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(app.theme.muted)),
+        layout.elapsed,
+    );
+    frame.render_widget(
+        Paragraph::new(format_time(state.duration)).style(Style::default().fg(app.theme.muted)),
+        layout.duration,
+    );
+}
+
 pub(super) fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
     let state = app.player_state.clone();
     let status = player_status(&state);
-    let layout = player_layout(area, text_width(&status), false);
+    let layout = player_layout(area, text_width(&status), false, true);
     let icon = if state.title.is_empty() {
         "■"
     } else if state.paused {
@@ -1238,7 +1264,7 @@ pub(super) fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|track| track.album.clone())
         .unwrap_or_default();
-    frame.render_widget(panel(app, " 播放器 ", false), area);
+    frame.render_widget(panel_open_left(app, " 播放器 ", false), area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1274,25 +1300,7 @@ pub(super) fn draw_player(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(app.theme.muted)),
         layout.volume,
     );
-    frame.render_widget(
-        LineGauge::default()
-            .filled_style(Style::default().fg(app.theme.accent))
-            .unfilled_style(Style::default().fg(app.theme.panel_highlight))
-            .line_set(ratatui::symbols::line::NORMAL)
-            .ratio(state.progress)
-            .label(""),
-        layout.progress,
-    );
-    frame.render_widget(
-        Paragraph::new(format_time(state.elapsed))
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(app.theme.muted)),
-        layout.elapsed,
-    );
-    frame.render_widget(
-        Paragraph::new(format_time(state.duration)).style(Style::default().fg(app.theme.muted)),
-        layout.duration,
-    );
+    draw_player_clock(frame, app, &layout, &state);
     frame.render_widget(
         Paragraph::new(format!("p {PREVIOUS_ICON}")).style(Style::default().fg(app.theme.text)),
         layout.previous,
@@ -1778,67 +1786,6 @@ fn draw_navigation_cover(frame: &mut Frame, app: &mut App, cover_area: Rect) {
     frame.render_widget(Paragraph::new(lines), cover_area);
 }
 
-/// Fuse nav + player into an L: ├ at the inner corner, ┴ at the outer heel.
-fn join_nav_player_frame(frame: &mut Frame, app: &App, nav: Rect, player: Rect) {
-    if nav.width == 0 || player.width == 0 || player.height == 0 {
-        return;
-    }
-    let shared = if player.x + 1 == nav.right() {
-        player.x
-    } else if player.x == nav.right() {
-        nav.right().saturating_sub(1)
-    } else {
-        return;
-    };
-    let style = Style::default().fg(if app.focus == Focus::Navigation {
-        app.theme.accent
-    } else {
-        app.theme.border
-    });
-    let top = player.y;
-    let bottom = player.bottom().saturating_sub(1);
-    if bottom < top {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    set_border_symbol(
-        buf,
-        shared,
-        top,
-        ratatui::symbols::line::NORMAL.vertical_right,
-        style,
-    );
-    set_border_symbol(
-        buf,
-        shared,
-        bottom,
-        ratatui::symbols::line::NORMAL.horizontal_up,
-        style,
-    );
-    for y in (top + 1)..bottom {
-        set_border_symbol(
-            buf,
-            shared,
-            y,
-            ratatui::symbols::line::NORMAL.vertical,
-            style,
-        );
-    }
-}
-
-fn set_border_symbol(
-    buf: &mut ratatui::buffer::Buffer,
-    x: u16,
-    y: u16,
-    symbol: &str,
-    style: Style,
-) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_symbol(symbol);
-        cell.set_style(style);
-    }
-}
-
 pub(super) fn panel<'a>(app: &App, title: &'a str, focused: bool) -> Block<'a> {
     let border = if focused {
         app.theme.accent
@@ -1848,6 +1795,20 @@ pub(super) fn panel<'a>(app: &App, title: &'a str, focused: bool) -> Block<'a> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(app.theme.panel).fg(app.theme.text))
+}
+
+fn panel_open_left<'a>(app: &App, title: &'a str, focused: bool) -> Block<'a> {
+    let border = if focused {
+        app.theme.accent
+    } else {
+        app.theme.border
+    };
+    Block::default()
+        .title(title)
+        .borders(Borders::TOP.union(Borders::RIGHT).union(Borders::BOTTOM))
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(app.theme.panel).fg(app.theme.text))

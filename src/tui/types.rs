@@ -63,7 +63,8 @@ pub(super) const QR_PADDING_X: u16 = 2;
 pub(super) const QR_PADDING_Y: u16 = 1;
 pub(super) const QR_STATUS_GAP: u16 = 1;
 pub(super) const UI_TICK_INTERVAL: Duration = Duration::from_millis(100);
-pub(super) const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
+/// Same cadence as pigma: progress events wake the UI about 5 times a second.
+pub(super) const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 pub(super) const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const HELP_MAX_SCROLL: u16 = 8;
 pub(super) const LOCAL_IMPORT_HINT: &str = "暂无本地音乐 · 按 I 或点击这里导入";

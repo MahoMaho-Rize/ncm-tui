@@ -285,18 +285,6 @@ fn cache_only_events_do_not_request_a_redraw() {
 }
 
 #[test]
-fn playback_stamp_changes_with_elapsed_seconds_and_lyric_line() {
-    let (_directory, mut app) = test_app();
-    app.hits.progress = Rect::new(0, 0, 40, 1);
-    app.player_state.elapsed = Duration::from_millis(900);
-    app.player_state.progress = 0.1;
-    let first = playback_stamp(&app);
-    app.player_state.elapsed = Duration::from_millis(1_100);
-    app.player_state.progress = 0.1;
-    assert_ne!(first, playback_stamp(&app));
-}
-
-#[test]
 fn animation_is_disabled_when_idle_and_enabled_during_activity() {
     let (_directory, mut app) = test_app();
     app.loading = false;
@@ -395,7 +383,7 @@ fn compact_layout_keeps_navigation_and_player() {
         assert!(hits.nav.x >= 1);
         assert!(hits.content.x >= nav.right());
         assert_eq!(nav.bottom(), layout.player.bottom());
-        assert_eq!(layout.player.x, nav.right().saturating_sub(1));
+        assert_eq!(layout.player.x, nav.right());
     }
 }
 
@@ -488,7 +476,7 @@ fn player_controls_have_disjoint_hit_regions() {
         Rect::new(0, 0, 96, 5),
         Rect::new(0, 0, 160, 5),
     ] {
-        let layout = player_layout(area, 18, false);
+        let layout = player_layout(area, 18, false, false);
         let regions = [
             layout.progress,
             layout.previous,
@@ -510,7 +498,7 @@ fn player_controls_have_disjoint_hit_regions() {
 
 #[test]
 fn player_cover_sits_left_and_does_not_overlap_controls() {
-    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, true);
+    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, true, false);
     assert_eq!(layout.cover, Rect::new(1, 1, 8, 3));
     assert_eq!(layout.song_info.x, layout.cover.right() + 1);
     for region in [
@@ -624,22 +612,21 @@ fn nav_and_player_share_an_l_frame() {
     let nav = layout.navigation.unwrap();
     assert_eq!(nav.x, 0);
     assert_eq!(nav.bottom(), layout.player.bottom());
-    assert_eq!(layout.player.x, nav.right().saturating_sub(1));
+    assert_eq!(layout.player.x, nav.right());
     assert!(layout.browser[0].area.x >= nav.right());
     assert!(layout.browser[0].area.bottom() <= layout.player.y);
 
     let (_directory, mut app) = test_app();
     let (screen, _) = render_app(&mut app, 96, 24);
     assert!(
-        screen.contains('├'),
-        "L inner corner should be ├ :\n{screen}"
+        !screen.contains('├'),
+        "player should not grow a left splitter:\n{screen}"
     );
-    assert!(screen.contains('┴'), "L outer heel should be ┴ :\n{screen}");
 }
 
 #[test]
 fn keyboard_and_player_buttons_share_actions() {
-    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, false);
+    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, false, false);
     let hits = HitRegions {
         previous: layout.previous,
         pause: layout.pause,
@@ -664,7 +651,7 @@ fn keyboard_and_player_buttons_share_actions() {
 
 #[test]
 fn player_hit_widths_match_visible_controls() {
-    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, false);
+    let layout = player_layout(Rect::new(0, 0, 96, 5), 18, false, false);
     assert_eq!(layout.previous.width, text_width("p ‹"));
     assert_eq!(layout.pause.width, text_width("Space ▶"));
     assert_eq!(layout.next.width, text_width("› n"));
