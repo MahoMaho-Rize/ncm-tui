@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Pull an ncm-tui GitHub Release onto the origin",
+  "parameters": {
+    "Version": {
+      "type": "String",
+      "description": "Release version, with or without a leading v",
+      "interpolationType": "ENV_VAR",
+      "allowedPattern": "^v?[0-9]+\\.[0-9]+\\.[0-9][0-9A-Za-z._-]*$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "deployNcmTui",
+      "precondition": {
+        "StringEquals": ["platformType", "Linux"]
+      },
+      "inputs": {
+        "timeoutSeconds": "300",
+        "runCommand": [
+          "set -euo pipefail",
+          "/usr/local/bin/deploy-ncm-tui \"$SSM_Version\""
+        ]
+      }
+    }
+  ]
+}

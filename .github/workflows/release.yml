@@ -165,9 +165,9 @@ jobs:
             aws ssm send-command \
               --region "$AWS_REGION" \
               --instance-ids "$INSTANCE_ID" \
-              --document-name AWS-RunShellScript \
+              --document-name DeployNcmTui \
               --comment "ncm-tui origin sync ${VERSION}" \
-              --parameters "commands=[\"/usr/local/bin/deploy-ncm-tui ${VERSION}\"]" \
+              --parameters "Version=${VERSION}" \
               --query 'Command.CommandId' \
               --output text
           )"
