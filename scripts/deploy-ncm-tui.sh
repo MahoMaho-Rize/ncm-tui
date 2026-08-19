@@ -36,7 +36,7 @@ while IFS='	' read -r name url; do
     echo "==> downloading ${name}"
     curl -fL --retry 3 --retry-delay 1 -o "${TMP}/${name}" "$url"
     case "$name" in
-        *.tar.gz|sha256sums.txt) mv "${TMP}/${name}" "${TMP}/v${VERSION}/${name}" ;;
+        *.tar.gz|*.zip|sha256sums.txt) mv "${TMP}/${name}" "${TMP}/v${VERSION}/${name}" ;;
     esac
 done < "${TMP}/urls.txt"
 
@@ -64,7 +64,8 @@ cat > "${TMP}/index.html" <<EOF
 </head>
 <body>
   <p>ncm-tui ${VERSION}</p>
-  <p><code>curl -fsSL https://mahomaho-rize.com/ncm-tui/install.sh | sh</code></p>
+  <p>Unix: <code>curl -fsSL https://mahomaho-rize.com/ncm-tui/install.sh | sh</code></p>
+  <p>Windows: <code>irm https://mahomaho-rize.com/ncm-tui/install.ps1 | iex</code></p>
 </body>
 </html>
 EOF
@@ -72,6 +73,9 @@ EOF
 echo "==> installing into ${DEST}"
 mkdir -p "${DEST}/v${VERSION}"
 cp -f "${TMP}/install.sh" "${TMP}/latest" "${TMP}/index.html" "${DEST}/"
+if [ -f "${TMP}/install.ps1" ]; then
+    cp -f "${TMP}/install.ps1" "${DEST}/"
+fi
 cp -f "${TMP}/v${VERSION}/"* "${DEST}/v${VERSION}/"
 chmod 755 "${DEST}" "${DEST}/install.sh"
 find "${DEST}" -type f ! -name install.sh -exec chmod 644 {} +

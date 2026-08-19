@@ -46,6 +46,9 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             dist: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            dist: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
@@ -61,6 +64,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         env:
           NCM_TUI_TARGET: ${{ matrix.target }}
           NCM_TUI_DIST_TARGET: ${{ matrix.dist }}
@@ -71,9 +75,11 @@ jobs:
           name: ncm-tui-${{ matrix.dist }}
           path: |
             dist/install.sh
+            dist/install.ps1
             dist/latest
             dist/index.html
             dist/v*/ncm-tui-${{ matrix.dist }}.tar.gz
+            dist/v*/ncm-tui-${{ matrix.dist }}.zip
             dist/v*/sha256sums.txt
 
   package-fedora:
@@ -124,7 +130,7 @@ jobs:
         run: |
           set -eu
           mkdir -p upload
-          find artifacts -type f \( -name '*.tar.gz' -o -name install.sh \) -exec cp {} upload/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name install.sh -o -name install.ps1 \) -exec cp {} upload/ \;
           find artifacts -name sha256sums.txt -exec cat {} + | awk 'NF' | sort -u > upload/sha256sums.txt
           ls -l upload
 

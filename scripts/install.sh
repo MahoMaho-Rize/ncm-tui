@@ -60,7 +60,11 @@ detect_target() {
             printf '%s-%s\n' "$cpu" "$os_tag"
             return
             ;;
-        *) err "unsupported OS: $os (supported: macOS Apple Silicon, Linux)" ;;
+        MINGW*|MSYS*|CYGWIN*|Windows_NT)
+            printf 'x86_64-pc-windows-msvc\n'
+            return
+            ;;
+        *) err "unsupported OS: $os (supported: macOS Apple Silicon, Linux, Windows)" ;;
     esac
 }
 
@@ -76,7 +80,6 @@ digest_file() {
 
 need_cmd uname
 need_cmd mkdir
-need_cmd tar
 need_cmd curl
 need_cmd mktemp
 need_cmd awk
@@ -93,7 +96,17 @@ if [ -z "$VERSION" ]; then
 fi
 VERSION=${VERSION#v}
 
-archive="${APP}-${target}.tar.gz"
+case "$target" in
+    *windows*)
+        archive="${APP}-${target}.zip"
+        installed_name="${APP}.exe"
+        ;;
+    *)
+        need_cmd tar
+        archive="${APP}-${target}.tar.gz"
+        installed_name="${APP}"
+        ;;
+esac
 url="${BASE_URL}/v${VERSION}/${archive}"
 sums_url="${BASE_URL}/v${VERSION}/sha256sums.txt"
 
@@ -111,15 +124,26 @@ expected=$(awk -v f="$archive" '$2 == f { print $1; exit }' "${tmpdir}/sha256sum
 actual=$(digest_file "${tmpdir}/${archive}")
 [ "$expected" = "$actual" ] || err "checksum mismatch for ${archive}"
 
-tar -C "$tmpdir" -xzf "${tmpdir}/${archive}"
-[ -f "${tmpdir}/${APP}" ] || err "archive did not contain ${APP}"
+case "$archive" in
+    *.zip)
+        if command -v unzip >/dev/null 2>&1; then
+            unzip -qo "${tmpdir}/${archive}" -d "$tmpdir"
+        else
+            tar -C "$tmpdir" -xf "${tmpdir}/${archive}"
+        fi
+        ;;
+    *)
+        tar -C "$tmpdir" -xzf "${tmpdir}/${archive}"
+        ;;
+esac
+[ -f "${tmpdir}/${installed_name}" ] || err "archive did not contain ${installed_name}"
 
 mkdir -p "$BIN_DIR"
-cp "${tmpdir}/${APP}" "${BIN_DIR}/${APP}.new"
-chmod 755 "${BIN_DIR}/${APP}.new"
-mv -f "${BIN_DIR}/${APP}.new" "${BIN_DIR}/${APP}"
+cp "${tmpdir}/${installed_name}" "${BIN_DIR}/${installed_name}.new"
+chmod 755 "${BIN_DIR}/${installed_name}.new"
+mv -f "${BIN_DIR}/${installed_name}.new" "${BIN_DIR}/${installed_name}"
 
-info "installed ${BIN_DIR}/${APP}"
+info "installed ${BIN_DIR}/${installed_name}"
 case ":${PATH}:" in
     *":${BIN_DIR}:"*) ;;
     *)

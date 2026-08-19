@@ -25,14 +25,20 @@
 curl -fsSL https://mahomaho-rize.com/ncm-tui/install.sh | sh
 ```
 
+Windows（PowerShell）：
+
+```powershell
+irm https://mahomaho-rize.com/ncm-tui/install.ps1 | iex
+```
+
 默认安装最新版本。可以指定版本和安装目录：
 
 ```bash
 curl -fsSL https://mahomaho-rize.com/ncm-tui/install.sh | \
-  NCM_TUI_VERSION=0.1.0 NCM_TUI_INSTALL_DIR="$HOME/.local/bin" sh
+  NCM_TUI_VERSION=0.1.1 NCM_TUI_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
-预编译包支持 Apple Silicon macOS，以及 x86_64/aarch64 Linux。请确保安装目录已经加入 `PATH`。
+预编译包支持 Apple Silicon macOS、64 位 Windows，以及 x86_64/aarch64 Linux。请确保安装目录已经加入 `PATH`。
 
 ### 从源码构建
 
