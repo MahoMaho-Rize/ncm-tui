@@ -1,7 +1,7 @@
 //NetEase Cloud Music terminal frontend.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     path::PathBuf,
     time::{Duration, Instant},
@@ -37,7 +37,7 @@ use crate::{
     auth::{Authentication, Identity, QrChallenge, QrStatus},
     discovery::{
         AlbumSummary, ArtistSummary, Discovery, OnlineTrack, PlaylistScope, PlaylistSummary,
-        RankedTrack, SearchKind,
+        RankedTrack, SearchKind, SearchPage, TrackPage, liked_playlist,
     },
     download::{
         AudioQuality, DownloadReport, DownloadRequest, DownloadSource, Downloader, TrackSelection,
@@ -45,6 +45,8 @@ use crate::{
     library::{Library, LibraryStats, ScanReport, Track},
     lyrics::{LyricLine, Lyrics},
     organizer::MoveOutcome,
+    pagination::{self, PAGE_SIZE, PaginationInfo},
+    palette::{self, PaletteItem},
     playback_cache::{CacheStats, ClearReport, PlaybackCache},
     player::{Player, PlayerState},
     streaming::PreparedStream,
@@ -58,10 +60,12 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 const QR_PADDING_X: u16 = 2;
 const QR_PADDING_Y: u16 = 1;
 const QR_STATUS_GAP: u16 = 1;
-const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const UI_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(16);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const HELP_MAX_SCROLL: u16 = 8;
 const LOCAL_IMPORT_HINT: &str = "暂无本地音乐 · 按 I 或点击这里导入";
+const TOAST_TTL: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy)]
 struct Theme {
@@ -121,6 +125,7 @@ pub struct Services {
     pub downloader: Downloader,
     pub library_roots: Vec<PathBuf>,
     pub playback_cache: PlaybackCache,
+    pub ui_state_path: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -215,6 +220,7 @@ enum InputMode {
     Download,
     CacheSize,
     Import,
+    Palette,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +257,8 @@ enum UiAction {
     Details,
     Refresh,
     Import,
+    Palette,
+    HideLyrics,
     EditCacheSize,
     ClearCache,
     OpenRoute(Route),
@@ -368,6 +376,14 @@ fn action_hint(action: UiAction) -> ActionHint {
         UiAction::Import => ActionHint {
             key: "I",
             label: "导入",
+        },
+        UiAction::Palette => ActionHint {
+            key: "Ctrl+P",
+            label: "命令",
+        },
+        UiAction::HideLyrics => ActionHint {
+            key: "h",
+            label: "歌词栏",
         },
         UiAction::EditCacheSize => ActionHint {
             key: "s",
@@ -507,9 +523,16 @@ enum Loaded {
     Tracks(String, Vec<OnlineTrack>),
     RankedTracks(String, Vec<RankedTrack>),
     Playlists(Vec<PlaylistSummary>),
+    #[allow(dead_code)]
     Artists(Vec<ArtistSummary>),
+    #[allow(dead_code)]
     Albums(Vec<AlbumSummary>),
     LocalTracks(String, Vec<Track>, Option<LibraryStats>),
+    TrackPage(TrackPage, PagedSource),
+    SearchPage(SearchPage, PagedSource),
+    PlaylistPage(Vec<PlaylistSummary>, PaginationInfo, PagedSource),
+    AlbumPage(Vec<AlbumSummary>, PaginationInfo, PagedSource),
+    ArtistPage(Vec<ArtistSummary>, PaginationInfo, PagedSource),
 }
 
 struct ActiveJob {
@@ -524,6 +547,8 @@ struct BrowserColumn {
     content: Content,
     selected: usize,
     phase: ColumnPhase,
+    pagination: PaginationInfo,
+    source: Option<PagedSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -541,12 +566,67 @@ impl BrowserColumn {
             content: Content::Empty,
             selected: 0,
             phase: ColumnPhase::Loading,
+            pagination: PaginationInfo::default(),
+            source: None,
         }
     }
 
     fn is_loading(&self) -> bool {
-        self.phase == ColumnPhase::Loading
+        self.phase == ColumnPhase::Loading || self.pagination.loading
     }
+
+    fn ready(id: u64, title: String, content: Content) -> Self {
+        Self {
+            id,
+            title,
+            content,
+            selected: 0,
+            phase: ColumnPhase::Ready,
+            pagination: PaginationInfo::default(),
+            source: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PagedSource {
+    Playlist { id: u64, name: String },
+    Album { id: u64, name: String },
+    Artist { id: u64, name: String },
+    Search { query: String, kind: SearchKind },
+    UserPlaylists { user_id: u64, scope: PlaylistScope },
+    SubscribedAlbums,
+    SubscribedArtists,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToastKind {
+    Success,
+    Warn,
+    Error,
+}
+
+struct Toast {
+    kind: ToastKind,
+    message: String,
+    until: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaletteCommand {
+    Route(Route),
+    Import,
+    Scan,
+    Organize,
+    Login,
+    Download,
+    ToggleLyrics,
+    TogglePause,
+    NextTrack,
+    PreviousTrack,
+    Details,
+    Help,
+    HideLyrics,
 }
 
 enum AppEvent {
@@ -560,11 +640,19 @@ enum AppEvent {
     DownloadFinished(u64, Result<DownloadReport, String>),
     OrganizeFinished(u64, Result<Option<MoveOutcome>, String>),
     ScanFinished(u64, Result<ScanReport, String>),
+    PageLoaded {
+        column_id: Option<u64>,
+        generation: u64,
+        source: PagedSource,
+        offset: usize,
+        result: Result<Loaded, String>,
+    },
     LyricsLoaded(u64, Result<Lyrics, String>),
     DailyWarmed(Vec<OnlineTrack>),
     RecommendedWarmed(Vec<PlaylistSummary>),
     UserPlaylistsWarmed(Vec<PlaylistSummary>),
-    PlaylistWarmed(u64, String, Vec<OnlineTrack>),
+    AlbumsWarmed(Vec<AlbumSummary>),
+    ArtistsWarmed(Vec<ArtistSummary>),
     ListeningRankWarmed(ListeningRank, Vec<RankedTrack>),
     MetadataWarmFinished,
     CacheLimitUpdated(Result<CacheStats, String>),
@@ -657,6 +745,7 @@ struct App {
     play_mode: PlayMode,
     completion_latched: bool,
     show_lyrics: bool,
+    lyrics_hidden: bool,
     previous_focus: Focus,
     lyrics: LyricsState,
     lyrics_task: Option<JoinHandle<()>>,
@@ -680,9 +769,15 @@ struct App {
     playlist_track_cache: HashMap<u64, (String, Vec<OnlineTrack>)>,
     listening_week_cache: Option<Vec<RankedTrack>>,
     listening_all_cache: Option<Vec<RankedTrack>>,
+    album_cache: Option<Vec<AlbumSummary>>,
+    artist_cache: Option<Vec<ArtistSummary>>,
     metadata_warm_task: Option<JoinHandle<()>>,
     cache_task: Option<JoinHandle<()>>,
     cache_clear_armed_until: Option<Instant>,
+    pagination: PaginationInfo,
+    paged_source: Option<PagedSource>,
+    toasts: Vec<Toast>,
+    palette_selected: usize,
 }
 
 impl App {
@@ -693,6 +788,7 @@ impl App {
             Err(_) => (None, "音频输出不可用".into()),
         };
         let player_state = player.as_ref().map(Player::state).unwrap_or_default();
+        let lyrics_hidden = load_hide_lyrics(&services.ui_state_path);
         let mut app = Self {
             services,
             theme: Theme::from_env(),
@@ -730,6 +826,7 @@ impl App {
             play_mode: PlayMode::Sequential,
             completion_latched: false,
             show_lyrics: false,
+            lyrics_hidden,
             previous_focus: Focus::Content,
             lyrics: LyricsState::Idle,
             lyrics_task: None,
@@ -753,9 +850,15 @@ impl App {
             playlist_track_cache: HashMap::new(),
             listening_week_cache: None,
             listening_all_cache: None,
+            album_cache: None,
+            artist_cache: None,
             metadata_warm_task: None,
             cache_task: None,
             cache_clear_armed_until: None,
+            pagination: PaginationInfo::default(),
+            paged_source: None,
+            toasts: Vec::new(),
+            palette_selected: 0,
         };
         app.load_local();
         #[cfg(not(test))]
@@ -913,8 +1016,11 @@ impl App {
         self.mode = InputMode::Normal;
         self.input.clear();
         self.input_cursor = 0;
+        self.pagination = PaginationInfo::default();
+        self.paged_source = None;
         match route {
-            Route::Favorites | Route::Local | Route::Recent | Route::Queue => self.load_local(),
+            Route::Favorites => self.load_favorites(),
+            Route::Local | Route::Recent | Route::Queue => self.load_local(),
             Route::Daily => self.load_daily(),
             Route::Recommended => self.load_recommended(),
             Route::ListeningRank => self.load_listening_rank(),
@@ -940,13 +1046,63 @@ impl App {
     }
 
     fn requires_login(&mut self) -> bool {
-        if self.identity.is_none() {
-            self.status = "此入口需要登录，按 L 扫码登录".into();
-            self.content = Content::Empty;
-            true
-        } else {
-            false
+        if self.identity.is_some() {
+            return false;
         }
+        if self.auth_task.is_some() {
+            self.loading = true;
+            self.status = "正在恢复登录…".into();
+            return true;
+        }
+        self.push_toast(ToastKind::Warn, "离线 · 按 L 登录后可浏览网易云");
+        self.status = "离线 · 本地音乐仍可播放，按 L 登录网易云".into();
+        self.content = Content::Empty;
+        true
+    }
+
+    fn apply_identity(&mut self, identity: crate::auth::Identity) {
+        self.identity = Some(identity);
+        self.start_metadata_warmup();
+        if matches!(
+            self.route,
+            Route::Daily
+                | Route::Recommended
+                | Route::Favorites
+                | Route::ListeningRank
+                | Route::Created
+                | Route::Subscribed
+                | Route::Artists
+                | Route::Albums
+        ) && (self.content.is_empty()
+            || self.status.contains("离线")
+            || self.status.contains("登录"))
+        {
+            let route = self.route;
+            self.set_route(route);
+        }
+    }
+
+    fn push_toast(&mut self, kind: ToastKind, message: impl Into<String>) {
+        let message = message.into();
+        if message.is_empty() {
+            return;
+        }
+        self.toasts.retain(|toast| toast.message != message);
+        self.toasts.push(Toast {
+            kind,
+            message,
+            until: Instant::now() + TOAST_TTL,
+        });
+        if self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+    }
+
+    fn prune_toasts(&mut self) -> bool {
+        let before = self.toasts.len();
+        let now = Instant::now();
+        self.toasts.retain(|toast| toast.until > now);
+        before != self.toasts.len()
     }
 
     fn spawn_load<F>(&mut self, future: F)
@@ -971,6 +1127,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn spawn_column<F>(&mut self, title: String, future: F)
     where
         F: std::future::Future<Output = Result<Loaded, String>> + Send + 'static,
@@ -991,12 +1148,386 @@ impl App {
         self.column_tasks.insert(id, task);
     }
 
-    fn load_daily(&mut self) {
-        if self.requires_login() {
+    fn spawn_column_page(&mut self, title: String, source: PagedSource) {
+        let keep = match self.focus {
+            Focus::Content => 0,
+            Focus::Column(index) => index.saturating_add(1),
+            _ => self.columns.len(),
+        };
+        self.truncate_columns(keep);
+        let id = self.allocate_job_id();
+        let mut column = BrowserColumn::loading(id, title);
+        column.source = Some(source.clone());
+        column.pagination.loading = true;
+        column.pagination.limit = PAGE_SIZE;
+        self.columns.push(column);
+        self.focus = Focus::Column(self.columns.len() - 1);
+        self.fetch_page(Some(id), source, 0);
+    }
+
+    fn fetch_page(&mut self, column_id: Option<u64>, source: PagedSource, offset: usize) {
+        let discovery = self.services.discovery.clone();
+        let generation = self.generation;
+        let tx = self.event_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = load_source_page(discovery, source.clone(), offset).await;
+            let _ = tx.send(AppEvent::PageLoaded {
+                column_id,
+                generation,
+                source,
+                offset,
+                result,
+            });
+        });
+        if let Some(id) = column_id {
+            self.column_tasks.insert(id, task);
+        } else {
+            if let Some(existing) = self.online_task.take() {
+                existing.abort();
+            }
+            self.online_task = Some(task);
+        }
+    }
+
+    fn maybe_prefetch(&mut self) {
+        match self.focus {
+            Focus::Content => {
+                let Some(source) = self.paged_source.clone() else {
+                    return;
+                };
+                if !self
+                    .pagination
+                    .should_prefetch(self.selected, self.content.len())
+                {
+                    return;
+                }
+                self.pagination.loading = true;
+                self.fetch_page(None, source, self.pagination.offset);
+            }
+            Focus::Column(index) => {
+                let (id, source, offset) = {
+                    let Some(column) = self.columns.get(index) else {
+                        return;
+                    };
+                    if !column
+                        .pagination
+                        .should_prefetch(column.selected, column.content.len())
+                    {
+                        return;
+                    }
+                    let Some(source) = column.source.clone() else {
+                        return;
+                    };
+                    (column.id, source, column.pagination.offset)
+                };
+                if let Some(column) = self.columns.get_mut(index) {
+                    column.pagination.loading = true;
+                }
+                self.fetch_page(Some(id), source, offset);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_page(
+        &mut self,
+        loaded: Loaded,
+        source: PagedSource,
+        append: bool,
+        column_id: Option<u64>,
+    ) {
+        let (title, content, pagination) = match loaded {
+            Loaded::TrackPage(page, _) => (
+                page.title,
+                Content::Tracks(page.items.into_iter().map(Into::into).collect()),
+                page.pagination,
+            ),
+            Loaded::SearchPage(page, _) => {
+                let content = match page.kind {
+                    SearchKind::Song => {
+                        Content::Tracks(page.tracks.into_iter().map(Into::into).collect())
+                    }
+                    SearchKind::Album => Content::Albums(page.albums),
+                    SearchKind::Artist => Content::Artists(page.artists),
+                    SearchKind::Playlist => Content::Playlists(page.playlists),
+                };
+                (page.title, content, page.pagination)
+            }
+            Loaded::Tracks(title, tracks) => (
+                title,
+                Content::Tracks(tracks.into_iter().map(Into::into).collect()),
+                PaginationInfo::default(),
+            ),
+            Loaded::Playlists(values) => (
+                String::new(),
+                Content::Playlists(values),
+                PaginationInfo::default(),
+            ),
+            Loaded::Albums(values) => (
+                String::new(),
+                Content::Albums(values),
+                PaginationInfo::default(),
+            ),
+            Loaded::Artists(values) => (
+                String::new(),
+                Content::Artists(values),
+                PaginationInfo::default(),
+            ),
+            Loaded::RankedTracks(title, values) => (
+                title,
+                Content::Tracks(
+                    values
+                        .into_iter()
+                        .map(|ranked| {
+                            let mut row = TrackRow::from(ranked.track);
+                            row.play_count = ranked.play_count;
+                            row
+                        })
+                        .collect(),
+                ),
+                PaginationInfo::default(),
+            ),
+            Loaded::LocalTracks(title, values, _) => (
+                title,
+                Content::Tracks(values.into_iter().map(Into::into).collect()),
+                PaginationInfo::default(),
+            ),
+            Loaded::PlaylistPage(items, pagination, _) => {
+                (String::new(), Content::Playlists(items), pagination)
+            }
+            Loaded::AlbumPage(items, pagination, _) => {
+                (String::new(), Content::Albums(items), pagination)
+            }
+            Loaded::ArtistPage(items, pagination, _) => {
+                (String::new(), Content::Artists(items), pagination)
+            }
+        };
+        if let Some(id) = column_id {
+            let Some(column) = self.columns.iter_mut().find(|column| column.id == id) else {
+                return;
+            };
+            if append {
+                merge_content(&mut column.content, content);
+            } else {
+                column.content = content;
+                column.selected = 0;
+                column.phase = ColumnPhase::Ready;
+            }
+            if !title.is_empty() {
+                column.title = title;
+            }
+            column.pagination = pagination;
+            column.source = Some(source);
             return;
         }
+        if append {
+            merge_content(&mut self.content, content);
+        } else {
+            self.content = content;
+            self.selected = 0;
+            self.loading = false;
+            if !title.is_empty() {
+                self.title = title;
+            }
+        }
+        match &self.content {
+            Content::Playlists(items) => {
+                let cache = self.playlist_cache.get_or_insert_with(Vec::new);
+                pagination::merge_unique_by_id(cache, items.clone(), |playlist| playlist.id);
+            }
+            Content::Albums(items) => {
+                let cache = self.album_cache.get_or_insert_with(Vec::new);
+                pagination::merge_unique_by_id(cache, items.clone(), |album| album.id);
+            }
+            Content::Artists(items) => {
+                let cache = self.artist_cache.get_or_insert_with(Vec::new);
+                pagination::merge_unique_by_id(cache, items.clone(), |artist| artist.id);
+            }
+            _ => {}
+        }
+        self.pagination = pagination;
+        self.paged_source = Some(source.clone());
+        if self.route == Route::Favorites
+            && matches!(source, PagedSource::UserPlaylists { .. })
+            && let Some(liked) = self
+                .playlist_cache
+                .as_ref()
+                .and_then(|playlists| liked_playlist(playlists))
+                .cloned()
+        {
+            self.open_liked_playlist(liked);
+            return;
+        }
+        if self.content.is_empty() && self.pagination.has_more && !self.pagination.loading {
+            self.pagination.loading = true;
+            self.loading = true;
+            let offset = self.pagination.offset;
+            self.fetch_page(None, source, offset);
+        }
+    }
+
+    fn retry_focused_error(&mut self) -> bool {
+        let Focus::Column(index) = self.focus else {
+            return false;
+        };
+        let Some(column) = self.columns.get(index) else {
+            return false;
+        };
+        if !matches!(column.phase, ColumnPhase::Error(_)) {
+            return false;
+        }
+        let Some(source) = column.source.clone() else {
+            return false;
+        };
+        let id = column.id;
+        if let Some(column) = self.columns.get_mut(index) {
+            column.phase = ColumnPhase::Loading;
+            column.pagination.loading = true;
+            column.content = Content::Empty;
+        }
+        self.fetch_page(Some(id), source, 0);
+        true
+    }
+
+    fn open_palette(&mut self) {
+        self.show_help = false;
+        self.show_details = false;
+        self.mode = InputMode::Palette;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.palette_selected = 0;
+        self.status = "Ctrl+P 命令面板 · 输入筛选，Enter 执行".into();
+    }
+
+    fn palette_entries(&self) -> Vec<(PaletteItem, PaletteCommand)> {
+        let mut entries = Vec::new();
+        for route in Route::ALL {
+            entries.push((
+                PaletteItem::new(route.label(), "跳转", route.group()),
+                PaletteCommand::Route(route),
+            ));
+        }
+        entries.extend([
+            (
+                PaletteItem::new("导入本地音乐", "I", "import scan folder"),
+                PaletteCommand::Import,
+            ),
+            (
+                PaletteItem::new("扫描音乐目录", "r", "scan library refresh"),
+                PaletteCommand::Scan,
+            ),
+            (
+                PaletteItem::new("整理当前文件", "o", "organize"),
+                PaletteCommand::Organize,
+            ),
+            (
+                PaletteItem::new("扫码登录", "L", "login qr"),
+                PaletteCommand::Login,
+            ),
+            (
+                PaletteItem::new("新建下载", "D", "download"),
+                PaletteCommand::Download,
+            ),
+            (
+                PaletteItem::new("聚焦歌词", "l", "lyrics"),
+                PaletteCommand::ToggleLyrics,
+            ),
+            (
+                PaletteItem::new("播放/暂停", "Space", "pause play"),
+                PaletteCommand::TogglePause,
+            ),
+            (
+                PaletteItem::new("下一首", "n", "next"),
+                PaletteCommand::NextTrack,
+            ),
+            (
+                PaletteItem::new("上一首", "p", "previous"),
+                PaletteCommand::PreviousTrack,
+            ),
+            (
+                PaletteItem::new("歌曲详情", "i", "details"),
+                PaletteCommand::Details,
+            ),
+            (
+                PaletteItem::new("快捷键帮助", "?", "help"),
+                PaletteCommand::Help,
+            ),
+            (
+                PaletteItem::new("关闭或打开歌词栏", "h", "lyrics hide panel"),
+                PaletteCommand::HideLyrics,
+            ),
+        ]);
+        entries
+    }
+
+    fn filtered_palette(&self) -> Vec<(PaletteItem, PaletteCommand)> {
+        let entries = self.palette_entries();
+        let items = entries
+            .iter()
+            .map(|(item, _)| item.clone())
+            .collect::<Vec<_>>();
+        palette::filter_items(&items, &self.input)
+            .into_iter()
+            .filter_map(|index| entries.get(index).cloned())
+            .collect()
+    }
+
+    fn run_palette_selection(&mut self) {
+        let filtered = self.filtered_palette();
+        if filtered.is_empty() {
+            return;
+        }
+        let index = self.palette_selected.min(filtered.len() - 1);
+        let command = filtered[index].1;
+        self.mode = InputMode::Normal;
+        self.input.clear();
+        self.input_cursor = 0;
+        match command {
+            PaletteCommand::Route(route) => {
+                self.set_route(route);
+                self.focus = Focus::Content;
+            }
+            PaletteCommand::Import => self.begin_import(),
+            PaletteCommand::Scan => {
+                self.set_route(Route::Local);
+                self.focus = Focus::Content;
+                self.start_scan();
+            }
+            PaletteCommand::Organize => self.start_organize(),
+            PaletteCommand::Login => self.start_login(),
+            PaletteCommand::Download => {
+                self.set_route(Route::Downloads);
+                self.focus = Focus::Content;
+                self.mode = InputMode::Download;
+                self.input.clear();
+                self.input_cursor = 0;
+            }
+            PaletteCommand::ToggleLyrics => self.toggle_lyrics_focus(),
+            PaletteCommand::TogglePause => {
+                if let Some(player) = &mut self.player {
+                    player.toggle_pause();
+                }
+            }
+            PaletteCommand::NextTrack => self.next_track(1),
+            PaletteCommand::PreviousTrack => self.next_track(-1),
+            PaletteCommand::Details => self.show_details = self.selected_track().is_some(),
+            PaletteCommand::Help => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
+            PaletteCommand::HideLyrics => self.set_lyrics_hidden(!self.lyrics_hidden),
+        }
+    }
+
+    fn load_daily(&mut self) {
         if let Some(tracks) = self.daily_cache.clone() {
             self.use_cached_tracks("每日推荐", tracks);
+            if self.identity.is_none() {
+                self.status = "离线缓存 · 按 L 登录后刷新".into();
+            }
+            return;
+        }
+        if self.requires_login() {
             return;
         }
         let discovery = self.services.discovery.clone();
@@ -1010,11 +1541,14 @@ impl App {
     }
 
     fn load_recommended(&mut self) {
-        if self.requires_login() {
-            return;
-        }
         if let Some(playlists) = self.recommended_cache.clone() {
             self.use_cached_content(Content::Playlists(playlists));
+            if self.identity.is_none() {
+                self.status = "离线缓存 · 按 L 登录后刷新".into();
+            }
+            return;
+        }
+        if self.requires_login() {
             return;
         }
         let discovery = self.services.discovery.clone();
@@ -1028,74 +1562,121 @@ impl App {
     }
 
     fn load_playlists(&mut self, scope: PlaylistScope) {
+        if let Some(playlists) = self.playlist_cache.as_ref() {
+            let filtered = playlists
+                .iter()
+                .filter(|playlist| match scope {
+                    PlaylistScope::All => true,
+                    PlaylistScope::Created => {
+                        playlist.created_by_user && playlist.special_type != 5
+                    }
+                    PlaylistScope::Subscribed => !playlist.created_by_user,
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !filtered.is_empty() {
+                self.content = Content::Playlists(filtered);
+                self.loading = false;
+                self.selected = 0;
+                self.status.clear();
+                if self.identity.is_none() {
+                    self.status = "离线缓存 · 按 L 登录后刷新".into();
+                }
+                return;
+            }
+        }
         let Some(user_id) = self.identity.as_ref().map(|identity| identity.user_id) else {
             self.requires_login();
             return;
         };
-        if let Some(playlists) = self.playlist_cache.as_ref() {
-            self.content = Content::Playlists(
-                playlists
-                    .iter()
-                    .filter(|playlist| match scope {
-                        PlaylistScope::All => true,
-                        PlaylistScope::Created => playlist.created_by_user,
-                        PlaylistScope::Subscribed => !playlist.created_by_user,
-                    })
-                    .cloned()
-                    .collect(),
-            );
-            self.loading = false;
-            self.selected = 0;
-            self.status.clear();
-            return;
-        }
-        let discovery = self.services.discovery.clone();
-        self.spawn_load(async move {
-            discovery
-                .user_playlists(user_id, scope)
-                .await
-                .map(Loaded::Playlists)
-                .map_err(|error| error.to_string())
-        });
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        self.content = Content::Empty;
+        let source = PagedSource::UserPlaylists { user_id, scope };
+        self.paged_source = Some(source.clone());
+        self.pagination.loading = true;
+        self.fetch_page(None, source, 0);
     }
 
     fn load_albums(&mut self) {
+        if let Some(albums) = self.album_cache.clone()
+            && !albums.is_empty()
+        {
+            self.use_cached_content(Content::Albums(albums));
+            return;
+        }
         if self.requires_login() {
             return;
         }
-        let discovery = self.services.discovery.clone();
-        self.spawn_load(async move {
-            discovery
-                .subscribed_albums()
-                .await
-                .map(Loaded::Albums)
-                .map_err(|error| error.to_string())
-        });
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        self.content = Content::Empty;
+        self.paged_source = Some(PagedSource::SubscribedAlbums);
+        self.pagination.loading = true;
+        self.fetch_page(None, PagedSource::SubscribedAlbums, 0);
     }
 
     fn load_artists(&mut self) {
+        if let Some(artists) = self.artist_cache.clone()
+            && !artists.is_empty()
+        {
+            self.use_cached_content(Content::Artists(artists));
+            return;
+        }
         if self.requires_login() {
             return;
         }
-        let discovery = self.services.discovery.clone();
-        self.spawn_load(async move {
-            discovery
-                .subscribed_artists()
-                .await
-                .map(Loaded::Artists)
-                .map_err(|error| error.to_string())
-        });
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        self.content = Content::Empty;
+        self.paged_source = Some(PagedSource::SubscribedArtists);
+        self.pagination.loading = true;
+        self.fetch_page(None, PagedSource::SubscribedArtists, 0);
+    }
+
+    fn load_favorites(&mut self) {
+        if let Some(liked) = self
+            .playlist_cache
+            .as_ref()
+            .and_then(|playlists| liked_playlist(playlists))
+            .cloned()
+        {
+            self.open_liked_playlist(liked);
+            return;
+        }
+        if self.identity.is_some() {
+            self.load_playlists(PlaylistScope::All);
+            return;
+        }
+        self.load_local();
+    }
+
+    fn open_liked_playlist(&mut self, liked: PlaylistSummary) {
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        self.content = Content::Empty;
+        self.title = liked.name.clone();
+        let source = PagedSource::Playlist {
+            id: liked.id,
+            name: liked.name,
+        };
+        self.paged_source = Some(source.clone());
+        self.pagination.loading = true;
+        self.fetch_page(None, source, 0);
     }
 
     fn load_listening_rank(&mut self) {
+        if let Some(tracks) = self.listening_week_cache.clone() {
+            self.use_cached_ranked_tracks("本周听歌排行", tracks);
+            if self.identity.is_none() {
+                self.status = "离线缓存 · 按 L 登录后刷新".into();
+            }
+            return;
+        }
         let Some(user_id) = self.identity.as_ref().map(|identity| identity.user_id) else {
             self.requires_login();
             return;
         };
-        if let Some(tracks) = self.listening_week_cache.clone() {
-            self.use_cached_ranked_tracks("本周听歌排行", tracks);
-            return;
-        }
         let discovery = self.services.discovery.clone();
         self.spawn_load(async move {
             discovery
@@ -1113,19 +1694,20 @@ impl App {
             return;
         }
         self.mode = InputMode::Normal;
-        let discovery = self.services.discovery.clone();
-        let kind = self.search_kind;
-        self.spawn_load(async move {
-            let result = discovery
-                .search(&keyword, kind, 100)
-                .await
-                .map_err(|error| error.to_string())?;
-            let tracks = discovery
-                .track_details(&result.track_ids)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Loaded::Tracks(format!("搜索：{keyword}"), tracks))
-        });
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        self.content = Content::Empty;
+        self.pagination = PaginationInfo {
+            loading: true,
+            limit: PAGE_SIZE,
+            ..PaginationInfo::default()
+        };
+        let source = PagedSource::Search {
+            query: keyword,
+            kind: self.search_kind,
+        };
+        self.paged_source = Some(source.clone());
+        self.fetch_page(None, source, 0);
     }
 
     fn use_cached_content(&mut self, content: Content) {
@@ -1159,7 +1741,7 @@ impl App {
     fn open_playlist(&mut self, id: u64, name: String) {
         if let Some((cached_name, tracks)) = self.playlist_track_cache.get(&id).cloned() {
             let title = if cached_name.is_empty() {
-                name
+                name.clone()
             } else {
                 cached_name
             };
@@ -1167,20 +1749,23 @@ impl App {
                 title,
                 Content::Tracks(tracks.into_iter().map(Into::into).collect()),
             );
+            if let Some(column) = self.columns.last_mut() {
+                column.source = Some(PagedSource::Playlist {
+                    id,
+                    name: name.clone(),
+                });
+                let loaded = column.content.len();
+                column.pagination = PaginationInfo {
+                    offset: loaded,
+                    limit: PAGE_SIZE,
+                    has_more: loaded >= PAGE_SIZE,
+                    total: loaded as u64,
+                    loading: false,
+                };
+            }
             return;
         }
-        let discovery = self.services.discovery.clone();
-        let loading_title = name.clone();
-        self.spawn_column(loading_title, async move {
-            let (api_name, tracks) = discovery
-                .playlist_tracks(id)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Loaded::Tracks(
-                if api_name.is_empty() { name } else { api_name },
-                tracks,
-            ))
-        });
+        self.spawn_column_page(name.clone(), PagedSource::Playlist { id, name });
     }
 
     fn push_cached_column(&mut self, title: String, content: Content) {
@@ -1191,13 +1776,7 @@ impl App {
         };
         self.truncate_columns(keep);
         let id = self.allocate_job_id();
-        self.columns.push(BrowserColumn {
-            id,
-            title,
-            content,
-            selected: 0,
-            phase: ColumnPhase::Ready,
-        });
+        self.columns.push(BrowserColumn::ready(id, title, content));
         self.focus = Focus::Column(self.columns.len() - 1);
     }
 
@@ -1211,10 +1790,12 @@ impl App {
         let discovery = self.services.discovery.clone();
         let tx = self.event_tx.clone();
         self.metadata_warm_task = Some(tokio::spawn(async move {
-            let (daily, recommended, user_playlists, week_rank, all_rank) = tokio::join!(
+            let (daily, recommended, user_playlists, albums, artists, week_rank, all_rank) = tokio::join!(
                 discovery.daily_songs(),
                 discovery.recommended_playlists(),
-                discovery.user_playlists(user_id, PlaylistScope::All),
+                discovery.user_playlists_page(user_id, PlaylistScope::All, 0, 200),
+                discovery.subscribed_albums_page(0, PAGE_SIZE),
+                discovery.subscribed_artists_page(0, PAGE_SIZE),
                 discovery.listening_rank(user_id, ListeningRank::Week),
                 discovery.listening_rank(user_id, ListeningRank::All),
             );
@@ -1229,74 +1810,29 @@ impl App {
                 let _ = tx.send(AppEvent::ListeningRankWarmed(ListeningRank::All, tracks));
             }
 
-            let recommended = match recommended {
-                Ok(playlists) => {
-                    let _ = tx.send(AppEvent::RecommendedWarmed(playlists.clone()));
-                    playlists
-                }
-                Err(_) => Vec::new(),
-            };
-            let user_playlists = match user_playlists {
-                Ok(playlists) => {
-                    let _ = tx.send(AppEvent::UserPlaylistsWarmed(playlists.clone()));
-                    playlists
-                }
-                Err(_) => Vec::new(),
-            };
+            if let Ok(playlists) = recommended {
+                let _ = tx.send(AppEvent::RecommendedWarmed(playlists));
+            }
+            if let Ok(page) = user_playlists {
+                let _ = tx.send(AppEvent::UserPlaylistsWarmed(page.items));
+            }
+            if let Ok(page) = albums {
+                let _ = tx.send(AppEvent::AlbumsWarmed(page.items));
+            }
+            if let Ok(page) = artists {
+                let _ = tx.send(AppEvent::ArtistsWarmed(page.items));
+            }
 
-            let mut seen = HashSet::new();
-            let mut details = tokio::task::JoinSet::new();
-            for playlist in recommended.into_iter().chain(user_playlists) {
-                if !seen.insert(playlist.id) {
-                    continue;
-                }
-                let discovery = discovery.clone();
-                details.spawn(async move {
-                    (playlist.id, discovery.playlist_tracks(playlist.id).await)
-                });
-            }
-            while let Some(result) = details.join_next().await {
-                let Ok((id, Ok((name, tracks)))) = result else {
-                    continue;
-                };
-                if tx.send(AppEvent::PlaylistWarmed(id, name, tracks)).is_err() {
-                    break;
-                }
-            }
             let _ = tx.send(AppEvent::MetadataWarmFinished);
         }));
     }
 
     fn open_album(&mut self, id: u64, name: String) {
-        let discovery = self.services.discovery.clone();
-        let loading_title = name.clone();
-        self.spawn_column(loading_title, async move {
-            let result = discovery
-                .album(id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let tracks = discovery
-                .track_details(&result.track_ids)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Loaded::Tracks(name, tracks))
-        });
+        self.spawn_column_page(name.clone(), PagedSource::Album { id, name });
     }
 
     fn open_artist(&mut self, id: u64, name: String) {
-        let discovery = self.services.discovery.clone();
-        let loading_title = name.clone();
-        self.spawn_column(loading_title, async move {
-            let result = discovery
-                .artist_tracks(id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let tracks = discovery
-                .track_details(&result.track_ids)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Loaded::Tracks(name, tracks))
-        });
+        self.spawn_column_page(name.clone(), PagedSource::Artist { id, name });
     }
 
     fn back(&mut self) {
@@ -1336,6 +1872,7 @@ impl App {
         } else {
             selected.saturating_add_signed(delta).min(len - 1)
         };
+        self.maybe_prefetch();
     }
 
     fn activate(&mut self) {
@@ -1798,7 +2335,9 @@ impl App {
         order.push(Focus::Navigation);
         order.push(Focus::Content);
         order.extend((0..self.columns.len()).map(Focus::Column));
-        order.push(Focus::Lyrics);
+        if !self.lyrics_hidden {
+            order.push(Focus::Lyrics);
+        }
         let current = order
             .iter()
             .position(|focus| *focus == self.focus)
@@ -1814,7 +2353,31 @@ impl App {
         }
     }
 
+    fn set_lyrics_hidden(&mut self, hidden: bool) {
+        self.lyrics_hidden = hidden;
+        if hidden {
+            if self.focus == Focus::Lyrics {
+                self.focus = self.valid_focus(self.previous_focus);
+            }
+            self.show_lyrics = false;
+        }
+        save_hide_lyrics(&self.services.ui_state_path, hidden);
+        self.status = if hidden {
+            "已关闭歌词栏 · 按 h 再打开".into()
+        } else {
+            "已打开歌词栏".into()
+        };
+        self.push_toast(ToastKind::Success, self.status.clone());
+    }
+
     fn toggle_lyrics_focus(&mut self) {
+        if self.lyrics_hidden {
+            self.set_lyrics_hidden(false);
+            self.previous_focus = self.valid_focus(self.focus);
+            self.focus = Focus::Lyrics;
+            self.show_lyrics = true;
+            return;
+        }
         if self.focus == Focus::Lyrics && self.show_lyrics {
             self.focus = self.valid_focus(self.previous_focus);
             self.show_lyrics = false;
@@ -1874,14 +2437,15 @@ impl App {
     }
 
     fn poll_events(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.prune_toasts();
         while let Ok(event) = self.event_rx.try_recv() {
             changed |= !matches!(
                 &event,
                 AppEvent::DailyWarmed(_)
                     | AppEvent::RecommendedWarmed(_)
                     | AppEvent::UserPlaylistsWarmed(_)
-                    | AppEvent::PlaylistWarmed(_, _, _)
+                    | AppEvent::AlbumsWarmed(_)
+                    | AppEvent::ArtistsWarmed(_)
                     | AppEvent::ListeningRankWarmed(_, _)
                     | AppEvent::MetadataWarmFinished
             );
@@ -1889,9 +2453,14 @@ impl App {
                 #[cfg(not(test))]
                 AppEvent::Identity(result) => {
                     self.auth_task.take();
-                    if let Ok(identity) = result {
-                        self.identity = Some(identity);
-                        self.start_metadata_warmup();
+                    match result {
+                        Ok(identity) => self.apply_identity(identity),
+                        Err(_) => {
+                            if self.loading && self.content.is_empty() {
+                                self.loading = false;
+                                self.status = "离线 · 按 L 登录网易云".into();
+                            }
+                        }
                     }
                 }
                 AppEvent::Loaded(generation, result) => {
@@ -1953,8 +2522,49 @@ impl App {
                                 self.status.clear();
                             }
                         }
+                        Ok(Loaded::TrackPage(page, source)) => {
+                            self.apply_page(
+                                Loaded::TrackPage(page, source.clone()),
+                                source,
+                                false,
+                                None,
+                            );
+                        }
+                        Ok(Loaded::SearchPage(page, source)) => {
+                            self.apply_page(
+                                Loaded::SearchPage(page, source.clone()),
+                                source,
+                                false,
+                                None,
+                            );
+                        }
+                        Ok(Loaded::PlaylistPage(items, pagination, source)) => {
+                            self.apply_page(
+                                Loaded::PlaylistPage(items, pagination, source.clone()),
+                                source,
+                                false,
+                                None,
+                            );
+                        }
+                        Ok(Loaded::AlbumPage(items, pagination, source)) => {
+                            self.apply_page(
+                                Loaded::AlbumPage(items, pagination, source.clone()),
+                                source,
+                                false,
+                                None,
+                            );
+                        }
+                        Ok(Loaded::ArtistPage(items, pagination, source)) => {
+                            self.apply_page(
+                                Loaded::ArtistPage(items, pagination, source.clone()),
+                                source,
+                                false,
+                                None,
+                            );
+                        }
                         Err(error) => {
                             self.content = Content::Empty;
+                            self.push_toast(ToastKind::Error, error.clone());
                             self.status = error;
                         }
                     }
@@ -1962,55 +2572,160 @@ impl App {
                 }
                 AppEvent::ColumnLoaded(id, result) => {
                     self.column_tasks.remove(&id);
-                    let Some(column) = self.columns.iter_mut().find(|column| column.id == id)
-                    else {
-                        continue;
-                    };
                     match result {
-                        Ok(Loaded::Tracks(title, values)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.title = title;
-                            column.content =
-                                Content::Tracks(values.into_iter().map(Into::into).collect());
-                        }
-                        Ok(Loaded::RankedTracks(title, values)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.title = title;
-                            column.content = Content::Tracks(
-                                values
-                                    .into_iter()
-                                    .map(|ranked| {
-                                        let mut row = TrackRow::from(ranked.track);
-                                        row.play_count = ranked.play_count;
-                                        row
-                                    })
-                                    .collect(),
+                        Ok(Loaded::TrackPage(page, source)) => {
+                            self.apply_page(
+                                Loaded::TrackPage(page, source.clone()),
+                                source,
+                                false,
+                                Some(id),
                             );
                         }
-                        Ok(Loaded::Playlists(values)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.content = Content::Playlists(values);
+                        Ok(Loaded::SearchPage(page, source)) => {
+                            self.apply_page(
+                                Loaded::SearchPage(page, source.clone()),
+                                source,
+                                false,
+                                Some(id),
+                            );
                         }
-                        Ok(Loaded::Artists(values)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.content = Content::Artists(values);
-                        }
-                        Ok(Loaded::Albums(values)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.content = Content::Albums(values);
-                        }
-                        Ok(Loaded::LocalTracks(title, values, _)) => {
-                            column.phase = ColumnPhase::Ready;
-                            column.title = title;
-                            column.content =
-                                Content::Tracks(values.into_iter().map(Into::into).collect());
-                        }
-                        Err(error) => {
-                            column.content = Content::Empty;
-                            column.phase = ColumnPhase::Error(error);
+                        other => {
+                            let toast = {
+                                let Some(column) =
+                                    self.columns.iter_mut().find(|column| column.id == id)
+                                else {
+                                    continue;
+                                };
+                                let toast = match other {
+                                    Ok(Loaded::Tracks(title, values)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.title = title;
+                                        column.content = Content::Tracks(
+                                            values.into_iter().map(Into::into).collect(),
+                                        );
+                                        None
+                                    }
+                                    Ok(Loaded::RankedTracks(title, values)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.title = title;
+                                        column.content = Content::Tracks(
+                                            values
+                                                .into_iter()
+                                                .map(|ranked| {
+                                                    let mut row = TrackRow::from(ranked.track);
+                                                    row.play_count = ranked.play_count;
+                                                    row
+                                                })
+                                                .collect(),
+                                        );
+                                        None
+                                    }
+                                    Ok(Loaded::Playlists(values)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.content = Content::Playlists(values);
+                                        None
+                                    }
+                                    Ok(Loaded::Artists(values)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.content = Content::Artists(values);
+                                        None
+                                    }
+                                    Ok(Loaded::Albums(values)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.content = Content::Albums(values);
+                                        None
+                                    }
+                                    Ok(Loaded::LocalTracks(title, values, _)) => {
+                                        column.phase = ColumnPhase::Ready;
+                                        column.title = title;
+                                        column.content = Content::Tracks(
+                                            values.into_iter().map(Into::into).collect(),
+                                        );
+                                        None
+                                    }
+                                    Err(error) => {
+                                        column.content = Content::Empty;
+                                        column.phase = ColumnPhase::Error(error.clone());
+                                        Some(error)
+                                    }
+                                    Ok(
+                                        Loaded::TrackPage(_, _)
+                                        | Loaded::SearchPage(_, _)
+                                        | Loaded::PlaylistPage(_, _, _)
+                                        | Loaded::AlbumPage(_, _, _)
+                                        | Loaded::ArtistPage(_, _, _),
+                                    ) => None,
+                                };
+                                column.selected = 0;
+                                toast
+                            };
+                            if let Some(error) = toast {
+                                self.push_toast(ToastKind::Error, error);
+                            }
                         }
                     }
-                    column.selected = 0;
+                }
+                AppEvent::PageLoaded {
+                    column_id,
+                    generation,
+                    source,
+                    offset,
+                    result,
+                } => {
+                    if column_id.is_none() && generation != self.generation {
+                        continue;
+                    }
+                    if let Some(id) = column_id
+                        && !self.columns.iter().any(|column| column.id == id)
+                    {
+                        continue;
+                    }
+                    match result {
+                        Ok(loaded) => {
+                            let append = offset > 0;
+                            if column_id.is_none() {
+                                self.online_task.take();
+                                self.loading = false;
+                            } else if let Some(id) = column_id {
+                                self.column_tasks.remove(&id);
+                            }
+                            if let Loaded::TrackPage(page, _) = &loaded
+                                && offset == 0
+                                && let PagedSource::Playlist { id, .. } = source
+                            {
+                                self.playlist_track_cache
+                                    .insert(id, (page.title.clone(), page.items.clone()));
+                            }
+                            self.apply_page(loaded, source, append, column_id);
+                        }
+                        Err(error) => {
+                            if offset == 0 {
+                                if let Some(id) = column_id {
+                                    if let Some(column) =
+                                        self.columns.iter_mut().find(|column| column.id == id)
+                                    {
+                                        column.phase = ColumnPhase::Error(error.clone());
+                                        column.content = Content::Empty;
+                                        column.pagination.loading = false;
+                                    }
+                                } else {
+                                    self.loading = false;
+                                    self.content = Content::Empty;
+                                    self.status = error.clone();
+                                    self.pagination.loading = false;
+                                }
+                            } else if let Some(id) = column_id {
+                                if let Some(column) =
+                                    self.columns.iter_mut().find(|column| column.id == id)
+                                {
+                                    column.pagination.loading = false;
+                                }
+                            } else {
+                                self.pagination.loading = false;
+                            }
+                            self.push_toast(ToastKind::Error, error);
+                        }
+                    }
                 }
                 AppEvent::StreamReady(generation, track, result) => {
                     if generation != self.stream_generation {
@@ -2019,7 +2734,10 @@ impl App {
                     self.stream_task.take();
                     match result {
                         Ok(stream) => self.start_stream_playback(track, stream),
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            self.push_toast(ToastKind::Error, error.clone());
+                            self.status = error;
+                        }
                     }
                 }
                 AppEvent::LoginStarted(result) => {
@@ -2093,8 +2811,12 @@ impl App {
                             ) {
                                 self.load_local();
                             }
+                            self.push_toast(ToastKind::Success, self.status.clone());
                         }
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            self.push_toast(ToastKind::Error, error.clone());
+                            self.status = error;
+                        }
                     }
                 }
                 AppEvent::OrganizeFinished(id, result) => {
@@ -2109,6 +2831,14 @@ impl App {
                         Ok(None) => "缺少 NCM 元数据".into(),
                         Err(error) => error,
                     };
+                    let kind = if self.status.contains("完成") {
+                        ToastKind::Success
+                    } else if self.status.contains("缺少") || self.status.contains("存在") {
+                        ToastKind::Warn
+                    } else {
+                        ToastKind::Error
+                    };
+                    self.push_toast(kind, self.status.clone());
                     self.load_local();
                 }
                 AppEvent::ScanFinished(id, result) => {
@@ -2127,9 +2857,13 @@ impl App {
                                 "{verb} · 发现 {} · 新增 {} · 更新 {} · 缺失 {}",
                                 report.discovered, report.added, report.updated, report.missing
                             );
+                            self.push_toast(ToastKind::Success, self.status.clone());
                             self.load_local();
                         }
-                        Err(error) => self.status = error,
+                        Err(error) => {
+                            self.push_toast(ToastKind::Error, error.clone());
+                            self.status = error;
+                        }
                     }
                 }
                 AppEvent::LyricsLoaded(song_id, result) => {
@@ -2149,10 +2883,33 @@ impl App {
                     self.recommended_cache = Some(playlists);
                 }
                 AppEvent::UserPlaylistsWarmed(playlists) => {
-                    self.playlist_cache = Some(playlists);
+                    let cache = self.playlist_cache.get_or_insert_with(Vec::new);
+                    pagination::merge_unique_by_id(cache, playlists, |playlist| playlist.id);
+                    if matches!(
+                        self.route,
+                        Route::Created | Route::Subscribed | Route::Favorites
+                    ) && self.content.is_empty()
+                    {
+                        let route = self.route;
+                        self.set_route(route);
+                        changed = true;
+                    }
                 }
-                AppEvent::PlaylistWarmed(id, name, tracks) => {
-                    self.playlist_track_cache.insert(id, (name, tracks));
+                AppEvent::AlbumsWarmed(albums) => {
+                    let cache = self.album_cache.get_or_insert_with(Vec::new);
+                    pagination::merge_unique_by_id(cache, albums, |album| album.id);
+                    if self.route == Route::Albums && self.content.is_empty() {
+                        self.load_albums();
+                        changed = true;
+                    }
+                }
+                AppEvent::ArtistsWarmed(artists) => {
+                    let cache = self.artist_cache.get_or_insert_with(Vec::new);
+                    pagination::merge_unique_by_id(cache, artists, |artist| artist.id);
+                    if self.route == Route::Artists && self.content.is_empty() {
+                        self.load_artists();
+                        changed = true;
+                    }
                 }
                 AppEvent::ListeningRankWarmed(kind, tracks) => match kind {
                     ListeningRank::Week => self.listening_week_cache = Some(tracks),
@@ -2191,14 +2948,25 @@ impl App {
         changed
     }
 
-    fn needs_animation(&self) -> bool {
+    fn needs_ui_tick(&self) -> bool {
         self.loading
             || self.columns.iter().any(BrowserColumn::is_loading)
+            || self.pagination.loading
             || self.active_job.is_some()
             || matches!(self.lyrics, LyricsState::Loading(_))
-            || (!self.player_state.title.is_empty()
-                && !self.player_state.paused
-                && !self.player_state.finished)
+            || !self.toasts.is_empty()
+            || self.mode == InputMode::Palette
+    }
+
+    fn needs_progress_tick(&self) -> bool {
+        !self.player_state.title.is_empty()
+            && !self.player_state.paused
+            && !self.player_state.finished
+    }
+
+    #[cfg(test)]
+    fn needs_animation(&self) -> bool {
+        self.needs_ui_tick() || self.needs_progress_tick()
     }
 }
 
@@ -2272,18 +3040,20 @@ async fn run_loop(
     mut app: App,
 ) -> Result<(), TuiError> {
     let mut dirty = true;
-    let mut next_animation = Instant::now() + ANIMATION_INTERVAL;
+    let mut next_ui_tick = Instant::now() + UI_TICK_INTERVAL;
+    let mut next_progress = Instant::now() + PROGRESS_INTERVAL;
     loop {
         dirty |= app.poll_events();
         app.poll_login();
 
         let now = Instant::now();
-        if app.needs_animation() && now >= next_animation {
+        if app.needs_ui_tick() && now >= next_ui_tick {
             app.tick = app.tick.wrapping_add(1);
             dirty = true;
-            next_animation = now + ANIMATION_INTERVAL;
+            next_ui_tick = now + UI_TICK_INTERVAL;
         }
 
+        let playing = app.needs_progress_tick();
         if dirty {
             app.refresh_player_state();
             if app.playback_finished() {
@@ -2298,6 +3068,7 @@ async fn run_loop(
                     text_width(account_label(&app)),
                     1 + app.columns.len(),
                     app.focus,
+                    app.lyrics_hidden,
                     app.show_lyrics,
                 );
                 for hit in &mut app.hits.columns {
@@ -2316,18 +3087,36 @@ async fn run_loop(
                 draw(frame, &app);
             })?;
             dirty = false;
-            if app.needs_animation() && next_animation <= Instant::now() {
-                next_animation = Instant::now() + ANIMATION_INTERVAL;
+            next_progress = Instant::now() + PROGRESS_INTERVAL;
+        } else if playing && now >= next_progress {
+            app.refresh_player_state();
+            if app.playback_finished() {
+                app.handle_completion();
+                app.refresh_player_state();
+                dirty = true;
+                continue;
             }
+            terminal.draw(|frame| {
+                if let Some(layout) = app_layout(
+                    frame.area(),
+                    1 + app.columns.len(),
+                    app.focus,
+                    app.lyrics_hidden,
+                    app.show_lyrics,
+                ) {
+                    draw_player(frame, &app, layout.player);
+                }
+            })?;
+            next_progress = Instant::now() + PROGRESS_INTERVAL;
         }
 
-        let timeout = if app.needs_animation() {
-            next_animation
-                .saturating_duration_since(Instant::now())
-                .min(EVENT_POLL_INTERVAL)
-        } else {
-            EVENT_POLL_INTERVAL
-        };
+        let mut timeout = EVENT_POLL_INTERVAL;
+        if app.needs_ui_tick() {
+            timeout = timeout.min(next_ui_tick.saturating_duration_since(Instant::now()));
+        }
+        if playing {
+            timeout = timeout.min(next_progress.saturating_duration_since(Instant::now()));
+        }
         if !event::poll(timeout)? {
             continue;
         }
@@ -2355,6 +3144,47 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if key.code == KeyCode::Esc {
         return dispatch_action(app, UiAction::Back);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        if app.mode == InputMode::Palette {
+            app.mode = InputMode::Normal;
+            app.input.clear();
+            app.input_cursor = 0;
+            app.status.clear();
+            return false;
+        }
+        return dispatch_action(app, UiAction::Palette);
+    }
+    if app.mode == InputMode::Palette {
+        let filtered = app.filtered_palette().len();
+        match key.code {
+            KeyCode::Enter => app.run_palette_selection(),
+            KeyCode::Up => {
+                app.palette_selected = app.palette_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if filtered > 0 {
+                    app.palette_selected = app
+                        .palette_selected
+                        .saturating_add(1)
+                        .min(filtered.saturating_sub(1));
+                }
+            }
+            KeyCode::Home => app.palette_selected = 0,
+            KeyCode::End if filtered > 0 => app.palette_selected = filtered - 1,
+            _ => {
+                let _ = edit_input(&mut app.input, &mut app.input_cursor, key);
+                let filtered = app.filtered_palette().len();
+                if filtered == 0 {
+                    app.palette_selected = 0;
+                } else {
+                    app.palette_selected = app.palette_selected.min(filtered - 1);
+                }
+            }
+        }
+        return false;
     }
     if app.show_help {
         match key.code {
@@ -2384,7 +3214,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 InputMode::Download => app.start_download(),
                 InputMode::CacheSize => app.set_cache_size(),
                 InputMode::Import => app.start_import(),
-                InputMode::Normal => {}
+                InputMode::Palette | InputMode::Normal => {}
             }
         }
         return false;
@@ -2496,6 +3326,7 @@ fn normal_action(_focus: Focus, playback_active: bool, key: KeyEvent) -> Option<
         KeyCode::Enter => Some(UiAction::Activate),
         KeyCode::Char('L') => Some(UiAction::Login),
         KeyCode::Char('l') => Some(UiAction::ToggleLyrics),
+        KeyCode::Char('h') => Some(UiAction::HideLyrics),
         KeyCode::Char('/') => Some(UiAction::Search),
         KeyCode::Char('D') => Some(UiAction::Download),
         KeyCode::Char(' ') => Some(UiAction::TogglePause),
@@ -2571,7 +3402,13 @@ fn dispatch_action(app: &mut App, action: UiAction) -> bool {
         },
         UiAction::PagePrevious => app.move_selection(-10),
         UiAction::PageNext => app.move_selection(10),
-        UiAction::Activate => app.activate(),
+        UiAction::Activate => {
+            if !app.retry_focused_error() {
+                app.activate();
+            }
+        }
+        UiAction::Palette => app.open_palette(),
+        UiAction::HideLyrics => app.set_lyrics_hidden(!app.lyrics_hidden),
         UiAction::Search => {
             if app.route == Route::Local {
                 app.mode = InputMode::LocalSearch;
@@ -2631,7 +3468,8 @@ fn dispatch_action(app: &mut App, action: UiAction) -> bool {
         UiAction::Organize => app.start_organize(),
         UiAction::Details => app.show_details = app.selected_track().is_some(),
         UiAction::Refresh => {
-            if app.route == Route::Local {
+            if app.retry_focused_error() {
+            } else if app.route == Route::Local {
                 app.start_scan();
             } else {
                 let route = app.route;
@@ -2921,10 +3759,96 @@ fn query_local(
     Ok((tracks, stats))
 }
 
+fn merge_content(existing: &mut Content, extra: Content) {
+    match (existing, extra) {
+        (Content::Tracks(current), Content::Tracks(more)) => {
+            pagination::merge_unique_by_id(current, more, |track| track.id);
+        }
+        (Content::Playlists(current), Content::Playlists(more)) => {
+            pagination::merge_unique_by_id(current, more, |playlist| playlist.id);
+        }
+        (Content::Albums(current), Content::Albums(more)) => {
+            pagination::merge_unique_by_id(current, more, |album| album.id);
+        }
+        (Content::Artists(current), Content::Artists(more)) => {
+            pagination::merge_unique_by_id(current, more, |artist| artist.id);
+        }
+        (current, extra) => *current = extra,
+    }
+}
+
+async fn load_source_page(
+    discovery: Discovery,
+    source: PagedSource,
+    offset: usize,
+) -> Result<Loaded, String> {
+    match source.clone() {
+        PagedSource::Playlist { id, name } => {
+            let mut page = discovery
+                .playlist_page(id, offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            if page.title.is_empty() {
+                page.title = name;
+            }
+            Ok(Loaded::TrackPage(page, source))
+        }
+        PagedSource::Album { id, name } => {
+            let mut page = discovery
+                .album_page(id, offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            if page.title.is_empty() {
+                page.title = name;
+            }
+            Ok(Loaded::TrackPage(page, source))
+        }
+        PagedSource::Artist { id, name } => {
+            let mut page = discovery
+                .artist_song_page(id, offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            if page.title.is_empty() {
+                page.title = name;
+            }
+            Ok(Loaded::TrackPage(page, source))
+        }
+        PagedSource::Search { query, kind } => {
+            let page = discovery
+                .search_page(&query, kind, offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Loaded::SearchPage(page, source))
+        }
+        PagedSource::UserPlaylists { user_id, scope } => {
+            let page = discovery
+                .user_playlists_page(user_id, scope, offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Loaded::PlaylistPage(page.items, page.pagination, source))
+        }
+        PagedSource::SubscribedAlbums => {
+            let page = discovery
+                .subscribed_albums_page(offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Loaded::AlbumPage(page.items, page.pagination, source))
+        }
+        PagedSource::SubscribedArtists => {
+            let page = discovery
+                .subscribed_artists_page(offset, PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(Loaded::ArtistPage(page.items, page.pagination, source))
+        }
+    }
+}
+
 fn app_layout(
     area: Rect,
     column_count: usize,
     focus: Focus,
+    lyrics_hidden: bool,
     lyrics_expanded: bool,
 ) -> Option<AppLayout> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -2944,7 +3868,7 @@ fn app_layout(
         _ => 0,
     };
     let (navigation, browser, lyrics) = if area.width < COMPACT_WIDTH {
-        if focus == Focus::Lyrics {
+        if focus == Focus::Lyrics && !lyrics_hidden {
             (None, Vec::new(), Some(rows[1]))
         } else {
             (
@@ -2965,7 +3889,9 @@ fn app_layout(
             rows[1].width.saturating_sub(nav_width),
             rows[1].height,
         );
-        let lyric_width = if lyrics_expanded && focus == Focus::Lyrics {
+        let lyric_width = if lyrics_hidden {
+            0
+        } else if lyrics_expanded && focus == Focus::Lyrics {
             (workspace.width.saturating_mul(2) / 3)
                 .min(workspace.width.saturating_sub(24))
                 .max(24)
@@ -2980,12 +3906,12 @@ fn app_layout(
             workspace.width.saturating_sub(lyric_width),
             workspace.height,
         );
-        let lyrics = Rect::new(
+        let lyrics = (lyric_width > 0).then_some(Rect::new(
             browser_area.right(),
             workspace.y,
             lyric_width,
             workspace.height,
-        );
+        ));
         let visible_count = (browser_area.width / 24)
             .max(1)
             .min(u16::try_from(column_count).unwrap_or(u16::MAX))
@@ -3008,7 +3934,7 @@ fn app_layout(
                 pane
             })
             .collect();
-        (Some(navigation), browser, Some(lyrics))
+        (Some(navigation), browser, lyrics)
     };
     Some(AppLayout {
         header: rows[0],
@@ -3026,9 +3952,10 @@ fn calculate_hits(
     account_width: u16,
     column_count: usize,
     focus: Focus,
+    lyrics_hidden: bool,
     lyrics_expanded: bool,
 ) -> HitRegions {
-    let Some(layout) = app_layout(area, column_count, focus, lyrics_expanded) else {
+    let Some(layout) = app_layout(area, column_count, focus, lyrics_hidden, lyrics_expanded) else {
         return HitRegions::default();
     };
     let player = player_layout(layout.player, player_status_width);
@@ -3180,7 +4107,13 @@ fn draw(frame: &mut Frame, app: &App) {
         Block::default().style(Style::default().bg(app.theme.background)),
         area,
     );
-    let Some(layout) = app_layout(area, 1 + app.columns.len(), app.focus, app.show_lyrics) else {
+    let Some(layout) = app_layout(
+        area,
+        1 + app.columns.len(),
+        app.focus,
+        app.lyrics_hidden,
+        app.show_lyrics,
+    ) else {
         draw_too_small(frame, app, area);
         return;
     };
@@ -3209,6 +4142,10 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.show_details {
         draw_details_overlay(frame, app, area);
     }
+    if app.mode == InputMode::Palette {
+        draw_palette(frame, app, area);
+    }
+    draw_toasts(frame, app, area);
 }
 
 fn draw_compact_navigation(frame: &mut Frame, app: &App, area: Rect) {
@@ -3364,6 +4301,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
             &border_title,
             app.selected,
             app.focus == Focus::Content,
+            app.pagination,
         ),
         Content::Playlists(playlists) => draw_playlists(
             frame,
@@ -3429,9 +4367,16 @@ fn draw_browser_column(frame: &mut Frame, app: &App, area: Rect, column_index: u
         format!(" {} ", column.title)
     };
     match &column.content {
-        Content::Tracks(values) => {
-            draw_tracks(frame, app, area, values, &title, column.selected, focused)
-        }
+        Content::Tracks(values) => draw_tracks(
+            frame,
+            app,
+            area,
+            values,
+            &title,
+            column.selected,
+            focused,
+            column.pagination,
+        ),
         Content::Playlists(values) => {
             draw_playlists(frame, app, area, values, &title, column.selected, focused)
         }
@@ -3449,7 +4394,7 @@ fn draw_browser_column(frame: &mut Frame, app: &App, area: Rect, column_index: u
                 ),
                 ColumnPhase::Ready => ("暂无内容".to_owned(), Style::default().fg(app.theme.muted)),
                 ColumnPhase::Error(error) => (
-                    format!("加载失败\n{error}\n\nEsc 返回上一级"),
+                    format!("加载失败\n{error}\n\nEnter 或 r 重试 · Esc 返回"),
                     Style::default().fg(Color::LightRed),
                 ),
             };
@@ -3734,6 +4679,7 @@ fn push_progress_spans(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_tracks(
     frame: &mut Frame,
     app: &App,
@@ -3742,6 +4688,7 @@ fn draw_tracks(
     title: &str,
     selected: usize,
     focused: bool,
+    page: PaginationInfo,
 ) {
     let visible = inner_rect(area).height as usize;
     let offset = content_offset(selected, visible as u16);
@@ -3791,7 +4738,7 @@ fn draw_tracks(
         .collect::<Vec<_>>();
     let mut state = ListState::default()
         .with_selected((!tracks.is_empty()).then_some(selected.saturating_sub(offset)));
-    let title = title_with_position(title, selected, tracks.len());
+    let title = title_with_page(title, selected, tracks.len(), page);
     frame.render_stateful_widget(
         List::new(items)
             .block(panel(app, &title, focused))
@@ -3973,12 +4920,21 @@ fn render_scrollbar(frame: &mut Frame, app: &App, area: Rect, total: usize, sele
 }
 
 fn title_with_position(title: &str, selected: usize, total: usize) -> String {
+    title_with_page(title, selected, total, PaginationInfo::default())
+}
+
+fn title_with_page(title: &str, selected: usize, loaded: usize, page: PaginationInfo) -> String {
     let title = title.trim();
-    if total == 0 {
-        format!(" {title} ")
-    } else {
-        format!(" {title} · {}/{} ", selected.min(total - 1) + 1, total)
+    if loaded == 0 {
+        return format!(" {title} ");
     }
+    let (total, plus) = page.display_total(loaded);
+    let mark = if page.has_more || plus { "+" } else { "" };
+    format!(
+        " {title} · {}/{}{mark} ",
+        selected.min(loaded - 1) + 1,
+        total
+    )
 }
 
 fn draw_account(frame: &mut Frame, app: &App, area: Rect) {
@@ -4268,7 +5224,7 @@ fn context_actions(app: &App) -> Vec<UiAction> {
             UiAction::SelectNext,
             UiAction::Activate,
             UiAction::FocusNext,
-            UiAction::Search,
+            UiAction::Palette,
             UiAction::ToggleHelp,
         ];
     }
@@ -4425,6 +5381,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.mode == InputMode::Import {
         let (text, cursor) = input_footer(" I 导入  ", &app.input, app.input_cursor, area.width);
         (text, Some(cursor))
+    } else if app.mode == InputMode::Palette {
+        let (text, cursor) = input_footer(" Ctrl+P  ", &app.input, app.input_cursor, area.width);
+        (text, Some(cursor))
     } else {
         (footer_text(app, area.width), None)
     };
@@ -4477,7 +5436,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 UiAction::ToggleFavorite,
                 UiAction::Details,
             ])),
-            Line::from("l 聚焦并放大歌词，再按恢复 · [/] 快退/快进"),
+            Line::from("l 聚焦并放大歌词，再按恢复 · h 彻底关闭/打开歌词栏 · [/] 快退/快进"),
             Line::from("音量处滚轮调节；进度轨道可点击"),
             Line::from(""),
             Line::from(Span::styled(
@@ -4501,9 +5460,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             ])),
             Line::from(hint_line(&[UiAction::EditCacheSize, UiAction::ClearCache])),
             Line::from(format!(
-                "{}  导入本地文件或目录  ·  {}  扫描已配置目录",
+                "{}  导入本地文件或目录  ·  {}  扫描已配置目录  ·  {}",
                 format_action_hint(UiAction::Import),
                 format_action_hint(UiAction::Refresh),
+                format_action_hint(UiAction::Palette),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -4847,6 +5807,111 @@ fn shorten(value: &str, max: usize) -> String {
     format!("{}…", value.chars().take(visible).collect::<String>())
 }
 
+fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered(
+        area,
+        56.min(area.width.saturating_sub(4)),
+        16.min(area.height.saturating_sub(4)),
+    );
+    frame.render_widget(Clear, popup);
+    let filtered = app.filtered_palette();
+    let selected = if filtered.is_empty() {
+        0
+    } else {
+        app.palette_selected.min(filtered.len() - 1)
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "命令  {}/{}",
+            selected.saturating_add(1).min(filtered.len()),
+            filtered.len()
+        ),
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "没有匹配的命令",
+            Style::default().fg(app.theme.muted),
+        )));
+    } else {
+        let visible = popup.height.saturating_sub(3) as usize;
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+        for (index, (item, _)) in filtered.iter().enumerate().skip(start).take(visible) {
+            let style = if index == selected {
+                selection_style(app, true)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", item.title), style),
+                Span::styled(
+                    format!("  {}", item.hint),
+                    Style::default().fg(app.theme.muted),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter 执行 · Esc 关闭 · ↑↓ 选择",
+        Style::default().fg(app.theme.muted),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(overlay_panel(app, " Ctrl+P "))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn draw_toasts(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(toast) = app.toasts.last() else {
+        return;
+    };
+    let color = match toast.kind {
+        ToastKind::Success => app.theme.accent,
+        ToastKind::Warn => Color::Yellow,
+        ToastKind::Error => Color::LightRed,
+    };
+    let width = text_width(&toast.message)
+        .saturating_add(4)
+        .min(area.width.saturating_sub(4))
+        .max(12);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.bottom().saturating_sub(4).max(area.y),
+        width,
+        3,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", toast.message),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .block(overlay_panel(app, " ")),
+        popup,
+    );
+}
+
+fn load_hide_lyrics(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| {
+        text.lines().any(|line| {
+            let line = line.trim().replace(' ', "");
+            line == "hide_lyrics=true"
+        })
+    })
+}
+
+fn save_hide_lyrics(path: &std::path::Path, hidden: bool) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("hide_lyrics = {hidden}\n"));
+}
+
 fn search_kind_label(kind: SearchKind) -> &'static str {
     match kind {
         SearchKind::Song => "歌曲",
@@ -4938,7 +6003,7 @@ fn empty_message(app: &App) -> String {
         }
         Route::Search => "按 / 输入关键词".into(),
         Route::Queue => "播放队列为空".into(),
-        Route::Favorites => "还没有喜欢的音乐".into(),
+        Route::Favorites => "还没有喜欢的音乐 · 登录后显示网易云红心歌单".into(),
         Route::Local => LOCAL_IMPORT_HINT.into(),
         Route::Recent => "暂无最近播放".into(),
         _ => "暂无内容".into(),
@@ -4968,6 +6033,7 @@ mod tests {
             library: Library::open(directory.path()).unwrap(),
             downloader: Downloader::new(client, directory.path(), 1).unwrap(),
             library_roots: vec![directory.path().to_path_buf()],
+            ui_state_path: directory.path().join("ui.toml"),
             playback_cache: PlaybackCache::open_blocking(
                 directory.path().join("playback-cache"),
                 4 * 1024 * 1024 * 1024,
@@ -5030,12 +6096,14 @@ mod tests {
                 name: "我创建的".into(),
                 track_count: 2,
                 created_by_user: true,
+                special_type: 0,
             },
             PlaylistSummary {
                 id: 2,
                 name: "我收藏的".into(),
                 track_count: 3,
                 created_by_user: false,
+                special_type: 0,
             },
         ]);
 
@@ -5102,6 +6170,7 @@ mod tests {
             name: "缓存歌单".into(),
             track_count: 1,
             created_by_user: false,
+            special_type: 0,
         }]);
         app.listening_week_cache = Some(vec![RankedTrack {
             track,
@@ -5133,9 +6202,6 @@ mod tests {
             .send(AppEvent::UserPlaylistsWarmed(vec![]))
             .unwrap();
         app.event_tx
-            .send(AppEvent::PlaylistWarmed(1, "歌单".into(), vec![]))
-            .unwrap();
-        app.event_tx
             .send(AppEvent::ListeningRankWarmed(ListeningRank::Week, vec![]))
             .unwrap();
         app.event_tx.send(AppEvent::MetadataWarmFinished).unwrap();
@@ -5144,7 +6210,6 @@ mod tests {
         assert!(app.daily_cache.is_some());
         assert!(app.recommended_cache.is_some());
         assert!(app.playlist_cache.is_some());
-        assert!(app.playlist_track_cache.contains_key(&1));
         assert!(app.listening_week_cache.is_some());
     }
 
@@ -5168,27 +6233,9 @@ mod tests {
         app.route = Route::Recommended;
         app.title = "为你精选".into();
         app.columns = vec![
-            BrowserColumn {
-                id: 1,
-                title: "电子音乐".into(),
-                content: Content::Empty,
-                selected: 0,
-                phase: ColumnPhase::Ready,
-            },
-            BrowserColumn {
-                id: 2,
-                title: "夜航".into(),
-                content: Content::Empty,
-                selected: 0,
-                phase: ColumnPhase::Ready,
-            },
-            BrowserColumn {
-                id: 3,
-                title: "夜航".into(),
-                content: Content::Empty,
-                selected: 0,
-                phase: ColumnPhase::Ready,
-            },
+            BrowserColumn::ready(1, "电子音乐".into(), Content::Empty),
+            BrowserColumn::ready(2, "夜航".into(), Content::Empty),
+            BrowserColumn::ready(3, "夜航".into(), Content::Empty),
         ];
 
         assert_eq!(
@@ -5248,6 +6295,7 @@ mod tests {
             1,
             Focus::Content,
             false,
+            false,
         );
         assert_eq!(hits.nav, Rect::default());
         assert_eq!(hits.content, Rect::default());
@@ -5257,8 +6305,8 @@ mod tests {
     fn compact_layout_gives_content_the_full_width() {
         for width in MIN_WIDTH..COMPACT_WIDTH {
             let area = Rect::new(0, 0, width, 24);
-            let layout = app_layout(area, 1, Focus::Content, false).unwrap();
-            let hits = calculate_hits(area, 16, 6, 1, Focus::Content, false);
+            let layout = app_layout(area, 1, Focus::Content, false, false).unwrap();
+            let hits = calculate_hits(area, 16, 6, 1, Focus::Content, false, false);
             assert_eq!(layout.navigation, None);
             assert_eq!(hits.nav, Rect::default());
             assert_eq!(hits.content.x, 1);
@@ -5268,7 +6316,15 @@ mod tests {
 
     #[test]
     fn panel_borders_are_not_interactive() {
-        let hits = calculate_hits(Rect::new(0, 0, 96, 30), 16, 6, 1, Focus::Content, false);
+        let hits = calculate_hits(
+            Rect::new(0, 0, 96, 30),
+            16,
+            6,
+            1,
+            Focus::Content,
+            false,
+            false,
+        );
         assert!(!contains(hits.nav, 0, hits.nav.y));
         assert!(!contains(hits.content, 24, hits.content.y));
         assert_eq!(hits.nav.x, 1);
@@ -5277,7 +6333,8 @@ mod tests {
 
     #[test]
     fn wide_layout_keeps_cascade_order_and_a_separate_lyrics_column() {
-        let layout = app_layout(Rect::new(0, 0, 160, 30), 4, Focus::Column(2), false).unwrap();
+        let layout =
+            app_layout(Rect::new(0, 0, 160, 30), 4, Focus::Column(2), false, false).unwrap();
         let lyrics = layout.lyrics.unwrap();
 
         assert!(layout.navigation.is_some());
@@ -5299,7 +6356,7 @@ mod tests {
 
     #[test]
     fn compact_lyrics_focus_does_not_compete_with_browser_columns() {
-        let layout = app_layout(Rect::new(0, 0, 60, 24), 3, Focus::Lyrics, true).unwrap();
+        let layout = app_layout(Rect::new(0, 0, 60, 24), 3, Focus::Lyrics, false, true).unwrap();
 
         assert!(layout.browser.is_empty());
         assert_eq!(layout.lyrics, Some(Rect::new(0, 2, 60, 16)));
@@ -5529,19 +6586,14 @@ mod tests {
         app.content = Content::Tracks(vec![test_track(1), test_track(2), test_track(3)]);
         app.columns = vec![
             BrowserColumn {
-                id: 1,
-                title: "第一层".into(),
-                content: Content::Tracks(vec![test_track(4), test_track(5)]),
                 selected: 1,
-                phase: ColumnPhase::Ready,
+                ..BrowserColumn::ready(
+                    1,
+                    "第一层".into(),
+                    Content::Tracks(vec![test_track(4), test_track(5)]),
+                )
             },
-            BrowserColumn {
-                id: 2,
-                title: "第二层".into(),
-                content: Content::Tracks(vec![test_track(6)]),
-                selected: 0,
-                phase: ColumnPhase::Ready,
-            },
+            BrowserColumn::ready(2, "第二层".into(), Content::Tracks(vec![test_track(6)])),
         ];
 
         app.back();
@@ -5566,11 +6618,12 @@ mod tests {
         app.content = Content::Tracks(vec![test_track(1), test_track(2)]);
         app.selected = 1;
         app.columns = vec![BrowserColumn {
-            id: 1,
-            title: "歌单".into(),
-            content: Content::Tracks(vec![test_track(3), test_track(4)]),
             selected: 1,
-            phase: ColumnPhase::Ready,
+            ..BrowserColumn::ready(
+                1,
+                "歌单".into(),
+                Content::Tracks(vec![test_track(3), test_track(4)]),
+            )
         }];
         app.focus = Focus::Column(0);
 
@@ -5585,6 +6638,37 @@ mod tests {
         assert!(!app.show_lyrics);
         assert_eq!(app.selected, 1);
         assert_eq!(app.columns[0].selected, 1);
+    }
+
+    #[test]
+    fn hiding_lyrics_gives_the_browser_the_full_workspace() {
+        let (_directory, mut app) = test_app();
+        app.set_lyrics_hidden(true);
+        let shown = app_layout(Rect::new(0, 0, 96, 24), 1, Focus::Content, false, false).unwrap();
+        let hidden = app_layout(Rect::new(0, 0, 96, 24), 1, Focus::Content, true, false).unwrap();
+        assert!(shown.lyrics.is_some());
+        assert!(hidden.lyrics.is_none());
+        assert!(hidden.browser[0].area.width > shown.browser[0].area.width);
+        assert!(app.lyrics_hidden);
+        assert!(
+            std::fs::read_to_string(&app.services.ui_state_path)
+                .unwrap()
+                .contains("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_reloads_an_empty_collection_route() {
+        let (_directory, mut app) = test_app();
+        app.route = Route::Created;
+        app.content = Content::Empty;
+        app.status = "离线 · 按 L 登录网易云".into();
+        app.apply_identity(Identity {
+            user_id: 7,
+            nickname: "测试".into(),
+        });
+        assert_eq!(app.identity.as_ref().map(|item| item.user_id), Some(7));
+        assert!(app.loading || app.online_task.is_some() || app.paged_source.is_some());
     }
 
     #[tokio::test]
@@ -5637,6 +6721,67 @@ mod tests {
         assert!(app.mode == InputMode::Normal);
         assert!(app.input.is_empty());
         assert!(app.loading);
+    }
+
+    #[tokio::test]
+    async fn command_palette_filters_and_jumps_to_a_route() {
+        let (_directory, mut app) = test_app();
+        dispatch_action(&mut app, UiAction::Palette);
+        assert_eq!(app.mode, InputMode::Palette);
+        app.input = "导入".into();
+        app.input_cursor = app.input.len();
+        let filtered = app.filtered_palette();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, PaletteCommand::Import);
+        app.palette_selected = 0;
+        app.run_palette_selection();
+        assert_eq!(app.mode, InputMode::Import);
+        assert_eq!(app.route, Route::Local);
+    }
+
+    #[tokio::test]
+    async fn offline_daily_route_uses_warm_cache() {
+        let (_directory, mut app) = test_app();
+        app.identity = None;
+        app.daily_cache = Some(vec![OnlineTrack {
+            id: 9,
+            title: "Cached Song".into(),
+            artists: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 180_000,
+        }]);
+        app.load_daily();
+        assert!(matches!(app.content, Content::Tracks(ref tracks) if tracks.len() == 1));
+        assert!(app.status.contains("离线缓存"));
+    }
+
+    #[test]
+    fn paged_title_marks_incomplete_windows() {
+        let page = PaginationInfo {
+            offset: 50,
+            limit: 50,
+            has_more: true,
+            total: 80,
+            loading: false,
+        };
+        assert_eq!(title_with_page("歌单", 0, 50, page), " 歌单 · 1/80+ ");
+    }
+
+    #[tokio::test]
+    async fn retry_reloads_an_errored_column() {
+        let (_directory, mut app) = test_app();
+        app.columns.push(BrowserColumn {
+            phase: ColumnPhase::Error("timeout".into()),
+            source: Some(PagedSource::Playlist {
+                id: 1,
+                name: "夜航".into(),
+            }),
+            ..BrowserColumn::ready(9, "夜航".into(), Content::Empty)
+        });
+        app.focus = Focus::Column(0);
+        assert!(app.retry_focused_error());
+        assert!(matches!(app.columns[0].phase, ColumnPhase::Loading));
+        assert!(app.columns[0].pagination.loading);
     }
 
     #[tokio::test]

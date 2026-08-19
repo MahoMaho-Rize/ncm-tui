@@ -7,6 +7,8 @@ pub mod library;
 pub mod lyrics;
 pub mod ncm_core;
 pub mod organizer;
+mod pagination;
+mod palette;
 pub mod playback_cache;
 pub mod player;
 mod scanner;

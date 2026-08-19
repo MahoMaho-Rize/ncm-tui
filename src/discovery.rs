@@ -15,6 +15,7 @@ use crate::ncm_core::{
     NcmClient, NcmError,
     api::{self, search::SearchType, user::ListeningRank},
 };
+use crate::pagination::PaginationInfo;
 use crate::streaming::PlaybackSource;
 
 const SEARCH_SONG_PAGE_SIZE: usize = 100;
@@ -59,6 +60,13 @@ pub struct PlaylistSummary {
     pub name: String,
     pub track_count: u64,
     pub created_by_user: bool,
+    pub special_type: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionPage<T> {
+    pub items: Vec<T>,
+    pub pagination: PaginationInfo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +108,30 @@ pub struct OnlineTrack {
     pub duration_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackPage {
+    pub title: String,
+    pub items: Vec<OnlineTrack>,
+    pub pagination: PaginationInfo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchPage {
+    pub title: String,
+    pub kind: SearchKind,
+    pub pagination: PaginationInfo,
+    pub tracks: Vec<OnlineTrack>,
+    pub albums: Vec<AlbumSummary>,
+    pub artists: Vec<ArtistSummary>,
+    pub playlists: Vec<PlaylistSummary>,
+}
+
+struct PlaylistCatalog {
+    name: String,
+    ids: Vec<u64>,
+    tracks: HashMap<u64, OnlineTrack>,
+}
+
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
     #[error(transparent)]
@@ -127,7 +159,7 @@ struct DiscoveryCache {
     daily_songs: OnceCell<Vec<OnlineTrack>>,
     recommended_playlists: OnceCell<Vec<PlaylistSummary>>,
     user_playlists: KeyedCache<u64, Vec<PlaylistSummary>>,
-    playlist_tracks: KeyedCache<u64, (String, Vec<OnlineTrack>)>,
+    playlist_catalogs: Mutex<HashMap<u64, Arc<Mutex<PlaylistCatalog>>>>,
     listening_ranks: KeyedCache<(u64, bool), Vec<RankedTrack>>,
 }
 
@@ -262,40 +294,94 @@ impl Discovery {
     /// the detail endpoint. Only IDs omitted from that response need another
     /// round trip, which keeps ordinary playlist opens to one API request.
     pub async fn playlist_tracks(&self, playlist_id: u64) -> Result<(String, Vec<OnlineTrack>)> {
-        let cell = {
-            let mut cache = self.cache.playlist_tracks.lock().await;
-            cache.entry(playlist_id).or_default().clone()
-        };
-        cell.get_or_try_init(|| async {
-            let response = self.playlist_response(playlist_id).await?;
-            let playlist = response
-                .get("playlist")
-                .ok_or(DiscoveryError::InvalidResponse("playlist"))?;
-            let track_ids = ids_at(playlist.get("trackIds"));
-            let mut tracks = playlist
-                .get("tracks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(parse_track)
-                .map(|track| (track.id, track))
-                .collect::<HashMap<_, _>>();
-            let missing = track_ids
+        let catalog = self.ensure_playlist_catalog(playlist_id).await?;
+        let total = catalog.lock().await.ids.len().max(1);
+        let page = self.playlist_page(playlist_id, 0, total).await?;
+        Ok((page.title, page.items))
+    }
+
+    pub async fn playlist_page(
+        &self,
+        playlist_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TrackPage> {
+        let catalog = self.ensure_playlist_catalog(playlist_id).await?;
+        let limit = limit.max(1);
+        let (title, slice, missing, total) = {
+            let catalog = catalog.lock().await;
+            let total = catalog.ids.len() as u64;
+            if offset >= catalog.ids.len() {
+                return Ok(TrackPage {
+                    title: catalog.name.clone(),
+                    items: Vec::new(),
+                    pagination: PaginationInfo::from_fetch(offset, limit, 0, total),
+                });
+            }
+            let end = offset.saturating_add(limit).min(catalog.ids.len());
+            let slice = catalog.ids[offset..end].to_vec();
+            let missing = slice
                 .iter()
                 .copied()
-                .filter(|id| !tracks.contains_key(id))
+                .filter(|id| !catalog.tracks.contains_key(id))
                 .collect::<Vec<_>>();
-            for track in self.track_details(&missing).await? {
-                tracks.insert(track.id, track);
+            (catalog.name.clone(), slice, missing, total)
+        };
+        if !missing.is_empty() {
+            let fetched = self.track_details(&missing).await?;
+            let mut catalog = catalog.lock().await;
+            for track in fetched {
+                catalog.tracks.insert(track.id, track);
             }
-            let ordered = track_ids
-                .into_iter()
-                .filter_map(|id| tracks.remove(&id))
-                .collect();
-            Ok((string_at(playlist, "name"), ordered))
+        }
+        let items = {
+            let catalog = catalog.lock().await;
+            slice
+                .iter()
+                .filter_map(|id| catalog.tracks.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let received = items.len();
+        Ok(TrackPage {
+            title,
+            items,
+            pagination: PaginationInfo::from_fetch(offset, limit, received, total),
         })
-        .await
-        .cloned()
+    }
+
+    async fn ensure_playlist_catalog(
+        &self,
+        playlist_id: u64,
+    ) -> Result<Arc<Mutex<PlaylistCatalog>>> {
+        {
+            let catalogs = self.cache.playlist_catalogs.lock().await;
+            if let Some(existing) = catalogs.get(&playlist_id) {
+                return Ok(existing.clone());
+            }
+        }
+        let response = self.playlist_response(playlist_id).await?;
+        let playlist = response
+            .get("playlist")
+            .ok_or(DiscoveryError::InvalidResponse("playlist"))?;
+        let ids = ids_at(playlist.get("trackIds"));
+        let tracks = playlist
+            .get("tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(parse_track)
+            .map(|track| (track.id, track))
+            .collect::<HashMap<_, _>>();
+        let catalog = Arc::new(Mutex::new(PlaylistCatalog {
+            name: string_at(playlist, "name"),
+            ids,
+            tracks,
+        }));
+        let mut catalogs = self.cache.playlist_catalogs.lock().await;
+        Ok(catalogs
+            .entry(playlist_id)
+            .or_insert_with(|| catalog.clone())
+            .clone())
     }
 
     async fn playlist_response(&self, playlist_id: u64) -> Result<Value> {
@@ -317,6 +403,70 @@ impl Discovery {
             total_found: track_ids.len() as u64,
             matched_items: 1,
             track_ids,
+        })
+    }
+
+    pub async fn album_page(
+        &self,
+        album_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TrackPage> {
+        let result = self.album(album_id).await?;
+        let limit = limit.max(1);
+        let total = result.track_ids.len() as u64;
+        let slice = result
+            .track_ids
+            .get(offset..offset.saturating_add(limit).min(result.track_ids.len()))
+            .unwrap_or(&[])
+            .to_vec();
+        let items = self.track_details(&slice).await?;
+        let received = items.len();
+        Ok(TrackPage {
+            title: result.name,
+            items,
+            pagination: PaginationInfo::from_fetch(offset, limit, received, total),
+        })
+    }
+
+    pub async fn artist_song_page(
+        &self,
+        artist_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<TrackPage> {
+        let limit = limit.max(1);
+        let response = checked(
+            self.client
+                .execute(api::artist::songs(artist_id, offset, limit))
+                .await?,
+        )?;
+        let items = response
+            .get("songs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(parse_track)
+            .collect::<Vec<_>>();
+        let total = number_at(&response, "total").unwrap_or_else(|| {
+            offset.saturating_add(items.len()) as u64
+                + u64::from(
+                    response
+                        .get("more")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(items.len() == limit),
+                )
+        });
+        let title = response
+            .get("artist")
+            .map(|artist| string_at(artist, "name"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("Artist {artist_id}"));
+        let received = items.len();
+        Ok(TrackPage {
+            title,
+            items,
+            pagination: PaginationInfo::from_fetch(offset, limit, received, total),
         })
     }
 
@@ -505,6 +655,77 @@ impl Discovery {
         })
     }
 
+    pub async fn search_page(
+        &self,
+        keyword: &str,
+        kind: SearchKind,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchPage> {
+        let keyword = keyword.trim();
+        let limit = limit.max(1);
+        if keyword.is_empty() {
+            return Ok(SearchPage {
+                title: String::new(),
+                kind,
+                pagination: PaginationInfo::from_fetch(offset, limit, 0, 0),
+                tracks: Vec::new(),
+                albums: Vec::new(),
+                artists: Vec::new(),
+                playlists: Vec::new(),
+            });
+        }
+        let response = checked(
+            self.client
+                .execute(api::search::cloud(keyword, kind.into(), limit, offset))
+                .await?,
+        )?;
+        let result = response
+            .get("result")
+            .ok_or(DiscoveryError::InvalidResponse("result"))?;
+        let (array_key, count_key) = search_keys(kind);
+        let total = number_at(result, count_key).unwrap_or_default();
+        let entities = result
+            .get(array_key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut page = SearchPage {
+            title: keyword.to_owned(),
+            kind,
+            pagination: PaginationInfo::default(),
+            tracks: Vec::new(),
+            albums: Vec::new(),
+            artists: Vec::new(),
+            playlists: Vec::new(),
+        };
+        match kind {
+            SearchKind::Song => {
+                page.tracks = entities.iter().filter_map(parse_track).collect();
+            }
+            SearchKind::Album => {
+                page.albums = entities.iter().filter_map(parse_album).collect();
+            }
+            SearchKind::Artist => {
+                page.artists = entities.iter().filter_map(parse_artist).collect();
+            }
+            SearchKind::Playlist => {
+                page.playlists = entities
+                    .iter()
+                    .filter_map(|value| parse_playlist(value, 0))
+                    .collect();
+            }
+        }
+        let received = match kind {
+            SearchKind::Song => page.tracks.len(),
+            SearchKind::Album => page.albums.len(),
+            SearchKind::Artist => page.artists.len(),
+            SearchKind::Playlist => page.playlists.len(),
+        };
+        page.pagination = PaginationInfo::from_fetch(offset, limit, received, total);
+        Ok(page)
+    }
+
     pub async fn user_playlists(
         &self,
         user_id: u64,
@@ -556,95 +777,140 @@ impl Discovery {
             .await?;
         Ok(playlists
             .iter()
-            .filter(|playlist| match scope {
-                PlaylistScope::All => true,
-                PlaylistScope::Created => playlist.created_by_user,
-                PlaylistScope::Subscribed => !playlist.created_by_user,
-            })
+            .filter(|playlist| matches_playlist_scope(playlist, scope))
             .cloned()
             .collect())
     }
 
+    pub async fn user_playlists_page(
+        &self,
+        user_id: u64,
+        scope: PlaylistScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<CollectionPage<PlaylistSummary>> {
+        let limit = limit.max(1);
+        let response = checked(
+            self.client
+                .execute(api::user::playlists(user_id, offset, limit))
+                .await?,
+        )?;
+        let batch = response
+            .get("playlist")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let received = batch.len();
+        let more = response
+            .get("more")
+            .and_then(Value::as_bool)
+            .unwrap_or(received == limit);
+        let items = batch
+            .iter()
+            .filter_map(|value| parse_playlist(value, user_id))
+            .filter(|playlist| matches_playlist_scope(playlist, scope))
+            .collect::<Vec<_>>();
+        Ok(CollectionPage {
+            items,
+            pagination: PaginationInfo::from_fetch(
+                offset,
+                limit,
+                received,
+                if more {
+                    0
+                } else {
+                    offset as u64 + received as u64
+                },
+            ),
+        })
+    }
+
     pub async fn subscribed_albums(&self) -> Result<Vec<AlbumSummary>> {
         let mut albums = Vec::new();
-        let mut seen = HashSet::new();
         let mut offset = 0;
-
         for _ in 0..MAX_PAGES {
-            let response = checked(
-                self.client
-                    .execute(api::user::subscribed_albums(offset, COLLECTION_PAGE_SIZE))
-                    .await?,
-            )?;
-            let batch = response
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if batch.is_empty() {
+            let page = self
+                .subscribed_albums_page(offset, COLLECTION_PAGE_SIZE)
+                .await?;
+            if page.items.is_empty() && !page.pagination.has_more {
                 break;
             }
-            for value in &batch {
-                let Some(summary) = parse_album(value) else {
-                    continue;
-                };
-                if seen.insert(summary.id) {
-                    albums.push(summary);
-                }
-            }
-            if !response
-                .get("hasMore")
-                .and_then(Value::as_bool)
-                .unwrap_or(batch.len() == COLLECTION_PAGE_SIZE)
-            {
+            albums.extend(page.items);
+            if !page.pagination.has_more {
                 break;
             }
-            offset += COLLECTION_PAGE_SIZE;
+            offset = page.pagination.offset;
         }
         Ok(albums)
     }
 
+    pub async fn subscribed_albums_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<CollectionPage<AlbumSummary>> {
+        let limit = limit.max(1);
+        let response = checked(
+            self.client
+                .execute(api::user::subscribed_albums(offset, limit))
+                .await?,
+        )?;
+        let batch = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let received = batch.len();
+        let total = number_at(&response, "count").unwrap_or_default();
+        let items = batch.iter().filter_map(parse_album).collect::<Vec<_>>();
+        Ok(CollectionPage {
+            items,
+            pagination: PaginationInfo::from_fetch(offset, limit, received, total),
+        })
+    }
+
     pub async fn subscribed_artists(&self) -> Result<Vec<ArtistSummary>> {
         let mut artists = Vec::new();
-        let mut seen = HashSet::new();
         let mut offset = 0;
         for _ in 0..MAX_PAGES {
-            let response = checked(
-                self.client
-                    .execute(api::user::subscribed_artists(offset, COLLECTION_PAGE_SIZE))
-                    .await?,
-            )?;
-            let batch = response
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if batch.is_empty() {
+            let page = self
+                .subscribed_artists_page(offset, COLLECTION_PAGE_SIZE)
+                .await?;
+            if page.items.is_empty() && !page.pagination.has_more {
                 break;
             }
-            for value in &batch {
-                let Some(id) = id_at(value, "id") else {
-                    continue;
-                };
-                if seen.insert(id) {
-                    artists.push(ArtistSummary {
-                        id,
-                        name: string_at(value, "name"),
-                        album_count: number_at(value, "albumSize").unwrap_or_default(),
-                        music_count: number_at(value, "musicSize").unwrap_or_default(),
-                    });
-                }
-            }
-            if !response
-                .get("hasMore")
-                .and_then(Value::as_bool)
-                .unwrap_or(batch.len() == COLLECTION_PAGE_SIZE)
-            {
+            artists.extend(page.items);
+            if !page.pagination.has_more {
                 break;
             }
-            offset += COLLECTION_PAGE_SIZE;
+            offset = page.pagination.offset;
         }
         Ok(artists)
+    }
+
+    pub async fn subscribed_artists_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<CollectionPage<ArtistSummary>> {
+        let limit = limit.max(1);
+        let response = checked(
+            self.client
+                .execute(api::user::subscribed_artists(offset, limit))
+                .await?,
+        )?;
+        let batch = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let received = batch.len();
+        let total = number_at(&response, "count").unwrap_or_default();
+        let items = batch.iter().filter_map(parse_artist).collect::<Vec<_>>();
+        Ok(CollectionPage {
+            items,
+            pagination: PaginationInfo::from_fetch(offset, limit, received, total),
+        })
     }
 
     pub async fn listening_rank(
@@ -735,6 +1001,35 @@ fn parse_playlist(value: &Value, user_id: u64) -> Option<PlaylistSummary> {
             .get("creator")
             .and_then(|creator| id_at(creator, "userId"))
             == Some(user_id),
+        special_type: number_at(value, "specialType").unwrap_or_default(),
+    })
+}
+
+pub fn liked_playlist(playlists: &[PlaylistSummary]) -> Option<&PlaylistSummary> {
+    playlists
+        .iter()
+        .find(|playlist| playlist.special_type == 5)
+        .or_else(|| {
+            playlists
+                .iter()
+                .find(|playlist| playlist.created_by_user && playlist.name.contains("喜欢"))
+        })
+}
+
+fn matches_playlist_scope(playlist: &PlaylistSummary, scope: PlaylistScope) -> bool {
+    match scope {
+        PlaylistScope::All => true,
+        PlaylistScope::Created => playlist.created_by_user && playlist.special_type != 5,
+        PlaylistScope::Subscribed => !playlist.created_by_user,
+    }
+}
+
+fn parse_artist(value: &Value) -> Option<ArtistSummary> {
+    Some(ArtistSummary {
+        id: id_at(value, "id")?,
+        name: string_at(value, "name"),
+        album_count: number_at(value, "albumSize").unwrap_or_default(),
+        music_count: number_at(value, "musicSize").unwrap_or_default(),
     })
 }
 
@@ -836,6 +1131,33 @@ mod tests {
         .unwrap();
         assert_eq!(playlist.id, 12);
         assert!(playlist.created_by_user);
+        assert_eq!(playlist.special_type, 0);
+
+        let liked = parse_playlist(
+            &json!({
+                "id": 99,
+                "name": "我喜欢的音乐",
+                "trackCount": 8,
+                "specialType": 5,
+                "creator": { "userId": 7 }
+            }),
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            liked_playlist(std::slice::from_ref(&liked)).map(|item| item.id),
+            Some(99)
+        );
+
+        let artist = parse_artist(&json!({
+            "id": "8",
+            "name": "22/7",
+            "albumSize": 4,
+            "musicSize": 40
+        }))
+        .unwrap();
+        assert_eq!(artist.id, 8);
+        assert_eq!(artist.album_count, 4);
 
         let album = parse_album(&json!({
             "id": 9,

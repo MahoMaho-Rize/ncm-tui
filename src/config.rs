@@ -14,6 +14,7 @@ pub struct Config {
     pub acoustid: AcoustidConfig,
     pub organize: OrganizeConfig,
     pub playback_cache: PlaybackCacheConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -112,6 +113,12 @@ pub struct AcoustidConfig {
 #[serde(default)]
 pub struct OrganizeConfig {
     pub dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub hide_lyrics: bool,
 }
 
 impl Default for OrganizeConfig {

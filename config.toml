@@ -55,6 +55,10 @@ api_key = ""
 # 是否启用 AcoustID 交叉验证（需要 fpcalc + api_key）
 enabled = false
 
+[ui]
+# 启动时是否隐藏右侧歌词栏（运行中按 h 可切换，并写入 .ncm-tui/ui.toml）
+hide_lyrics = false
+
 [organize]
 # 归档目标目录（将文件按专辑名移入子目录）
 dir = ""

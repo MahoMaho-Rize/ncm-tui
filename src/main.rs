@@ -38,6 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let playback_cache =
         PlaybackCache::open(&config.playback_cache.dir, config.playback_cache.max_bytes).await?;
+    let ui_state_path = config.download.dir.join(".ncm-tui").join("ui.toml");
+    if config.ui.hide_lyrics && !ui_state_path.exists() {
+        let _ = std::fs::create_dir_all(config.download.dir.join(".ncm-tui"));
+        let _ = std::fs::write(&ui_state_path, "hide_lyrics = true\n");
+    }
     let services = Services {
         authentication: Authentication::new(client.clone(), config.auth.session_file),
         discovery: Discovery::new(client.clone()),
@@ -45,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         downloader: Downloader::new(client, &config.download.dir, config.download.max_workers)?,
         library_roots,
         playback_cache,
+        ui_state_path,
     };
 
     tui::run(services).await?;
