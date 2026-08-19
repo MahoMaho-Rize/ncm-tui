@@ -35,7 +35,7 @@ irm https://mahomaho-rize.com/ncm-tui/install.ps1 | iex
 
 ```bash
 curl -fsSL https://mahomaho-rize.com/ncm-tui/install.sh | \
-  NCM_TUI_VERSION=0.1.1 NCM_TUI_INSTALL_DIR="$HOME/.local/bin" sh
+  NCM_TUI_VERSION=0.1.2 NCM_TUI_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 预编译包支持 Apple Silicon macOS、64 位 Windows，以及 x86_64/aarch64 Linux。请确保安装目录已经加入 `PATH`。
@@ -107,6 +107,7 @@ ncm-tui
 | `a` / `d` | 加入/移出播放队列 |
 | `f` | 收藏或取消收藏 |
 | `D` | 新建下载任务 |
+| `I` | 导入本地音乐 |
 | `L` | 登录 |
 | `r` | 刷新当前内容 |
 | `q` | 退出 |
