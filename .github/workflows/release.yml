@@ -7,12 +7,19 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to sync to origin (skips build)
+        required: false
+        type: string
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   test:
+    if: github.event_name != 'workflow_dispatch' || inputs.tag == ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -24,6 +31,7 @@ jobs:
         run: cargo test
 
   package:
+    if: github.event_name != 'workflow_dispatch' || inputs.tag == ''
     needs: test
     strategy:
       fail-fast: false
@@ -69,6 +77,7 @@ jobs:
             dist/v*/sha256sums.txt
 
   package-fedora:
+    if: github.event_name != 'workflow_dispatch' || inputs.tag == ''
     needs: test
     runs-on: ubuntu-latest
     container: fedora:42
@@ -124,3 +133,62 @@ jobs:
           files: upload/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  publish-origin:
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      always() &&
+      (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.tag != ''))
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      VERSION: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-ncm-tui-origin
+
+      - name: Pull release onto origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION#v}"
+          echo "Publishing ncm-tui ${VERSION} to origin"
+
+          COMMAND_ID="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "ncm-tui origin sync ${VERSION}" \
+              --parameters "commands=[\"/usr/local/bin/deploy-ncm-tui ${VERSION}\"]" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          if ! aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID"; then
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --output json || true
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
