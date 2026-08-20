@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     database::{DatabaseError, DownloadedTrack, LibraryDb},
-    library::LibraryError,
+    library::{Library, LibraryError},
     ncm_core::{NcmClient, NcmError, api},
     organizer::{OrganizableTrack, destination, safe_extension},
 };
@@ -227,18 +227,12 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    /// Opens all internal state below `download_root`; no DB path enters the UI.
-    pub fn new(
-        client: NcmClient,
-        download_root: impl AsRef<Path>,
-        concurrency: usize,
-    ) -> Result<Self> {
-        let root = download_root.as_ref().to_path_buf();
-        let library = LibraryDb::open(&root)?;
+    /// Reuses the library connection so downloads and playback share one catalog.
+    pub fn new(client: NcmClient, library: &Library, concurrency: usize) -> Result<Self> {
         Ok(Self {
             client,
-            library,
-            root,
+            library: library.db(),
+            root: library.root().to_path_buf(),
             concurrency: concurrency.max(1),
             cover_cache: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -302,6 +296,7 @@ impl Downloader {
                     &root,
                     &OrganizableTrack {
                         id: metadata.id,
+                        ncm_id: Some(metadata.id),
                         title: metadata.title.clone(),
                         artists: metadata.artists.clone(),
                         album: metadata.album.clone(),

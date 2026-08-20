@@ -10,6 +10,8 @@ use crate::{
     scanner,
 };
 
+pub use crate::database::{CatalogTrack, EnqueueOutcome, PlayOrigin};
+
 #[derive(Debug, Error)]
 pub enum LibraryError {
     #[error("local library storage failed: {0}")]
@@ -23,10 +25,12 @@ pub type Result<T> = std::result::Result<T, LibraryError>;
 #[derive(Clone, Debug)]
 pub struct Track {
     pub id: u64,
+    pub ncm_id: Option<u64>,
+    pub source_kind: String,
     pub title: String,
     pub artists: String,
     pub album: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub format: String,
     pub bytes: u64,
     pub downloaded_at: i64,
@@ -34,6 +38,7 @@ pub struct Track {
     pub favorite: bool,
     pub play_count: u64,
     pub last_played_at: Option<i64>,
+    pub cover_url: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -152,6 +157,14 @@ impl Library {
         })
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn db(&self) -> LibraryDb {
+        self.inner.clone()
+    }
+
     pub fn recent(&self, limit: usize) -> Result<Vec<Track>> {
         Ok(map_tracks(self.inner.recent(limit)?))
     }
@@ -196,8 +209,8 @@ impl Library {
         Ok(self.inner.toggle_favorite(track_id)?)
     }
 
-    pub fn enqueue(&self, track_id: u64) -> Result<bool> {
-        Ok(self.inner.enqueue(track_id)?)
+    pub fn enqueue_next(&self, track_id: u64) -> Result<EnqueueOutcome> {
+        Ok(self.inner.enqueue_next(track_id)?)
     }
 
     pub fn dequeue(&self, track_id: u64) -> Result<bool> {
@@ -208,8 +221,28 @@ impl Library {
         Ok(map_tracks(self.inner.queue()?))
     }
 
+    pub fn queue_index(&self) -> Result<Option<usize>> {
+        Ok(self.inner.queue_index()?)
+    }
+
+    pub fn set_queue_index(&self, index: Option<usize>) -> Result<()> {
+        Ok(self.inner.set_queue_index(index)?)
+    }
+
+    pub fn replace_queue(&self, track_ids: &[u64], current_index: Option<usize>) -> Result<()> {
+        Ok(self.inner.replace_queue(track_ids, current_index)?)
+    }
+
     pub fn clear_queue(&self) -> Result<usize> {
         Ok(self.inner.clear_queue()?)
+    }
+
+    pub fn ensure_catalog(&self, track: &CatalogTrack) -> Result<u64> {
+        Ok(self.inner.ensure_catalog(track)?)
+    }
+
+    pub fn ensure_catalog_many(&self, tracks: &[CatalogTrack]) -> Result<Vec<u64>> {
+        Ok(self.inner.ensure_catalog_many(tracks)?)
     }
 
     pub fn albums(&self) -> Result<Vec<AlbumGroup>> {
@@ -293,12 +326,12 @@ impl Library {
             }))
     }
 
-    pub fn history(&self, limit: usize) -> Result<Vec<(Track, i64)>> {
+    pub fn history(&self, limit: usize) -> Result<Vec<Track>> {
         Ok(self
             .inner
             .history(limit)?
             .into_iter()
-            .map(|(track, played_at)| (map_tracks(vec![track]).remove(0), played_at))
+            .map(|(track, _played_at)| map_track(track))
             .collect())
     }
 
@@ -306,8 +339,8 @@ impl Library {
         Ok(self.inner.reconcile_known_files()?)
     }
 
-    pub fn record_play(&self, track_id: u64) -> Result<bool> {
-        Ok(self.inner.record_play(track_id)?)
+    pub fn record_play(&self, track_id: u64, origin: PlayOrigin) -> Result<bool> {
+        Ok(self.inner.record_play(track_id, origin)?)
     }
 
     pub fn set_cover_url(&self, track_id: u64, cover_url: &str) -> Result<bool> {
@@ -350,28 +383,32 @@ impl Library {
     }
 }
 
-pub fn is_catalog_id(id: u64) -> bool {
-    id > 0 && id < 4_000_000_000_000_000_000
+pub fn is_catalog_id(ncm_id: u64) -> bool {
+    ncm_id > 0
 }
 
 fn map_tracks(tracks: Vec<LibraryTrack>) -> Vec<Track> {
-    tracks
-        .into_iter()
-        .map(|track| Track {
-            id: track.ncm_id,
-            title: track.title,
-            artists: track.artists,
-            album: track.album,
-            path: track.file_path,
-            format: track.format,
-            bytes: track.file_size,
-            downloaded_at: track.downloaded_at,
-            duration_ms: track.duration_ms,
-            favorite: track.favorite,
-            play_count: track.play_count,
-            last_played_at: track.last_played_at,
-        })
-        .collect()
+    tracks.into_iter().map(map_track).collect()
+}
+
+fn map_track(track: LibraryTrack) -> Track {
+    Track {
+        id: track.id,
+        ncm_id: track.ncm_id,
+        source_kind: track.source_kind,
+        title: track.title,
+        artists: track.artists,
+        album: track.album,
+        path: track.file_path,
+        format: track.format,
+        bytes: track.file_size,
+        downloaded_at: track.downloaded_at,
+        duration_ms: track.duration_ms,
+        favorite: track.favorite,
+        play_count: track.play_count,
+        last_played_at: track.last_played_at,
+        cover_url: track.cover_url,
+    }
 }
 
 #[cfg(test)]
@@ -381,10 +418,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_ids_exclude_local_import_range() {
+    fn catalog_ids_are_positive_ncm_ids() {
         assert!(is_catalog_id(186016));
         assert!(!is_catalog_id(0));
-        assert!(!is_catalog_id(4_000_000_000_000_000_000));
     }
 
     #[test]
@@ -457,5 +493,27 @@ mod tests {
         assert_eq!(unplayed.len(), 2);
         library.clear_queue().unwrap();
         assert!(library.queue().unwrap().is_empty());
+    }
+
+    #[test]
+    fn streamed_catalog_tracks_appear_in_history_not_local_recent() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let id = library
+            .ensure_catalog(&CatalogTrack {
+                ncm_id: 347230,
+                title: "海阔天空".into(),
+                artists: "Beyond".into(),
+                album: "乐与怒".into(),
+                duration_ms: 1_000,
+                cover_url: String::new(),
+            })
+            .unwrap();
+        library.record_play(id, PlayOrigin::Stream).unwrap();
+        let history = library.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].ncm_id, Some(347230));
+        assert!(history[0].path.is_none());
+        assert!(library.recent(10).unwrap().is_empty());
     }
 }

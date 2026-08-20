@@ -11,6 +11,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrganizableTrack {
     pub id: u64,
+    pub ncm_id: Option<u64>,
     pub title: String,
     pub artists: String,
     pub album: String,
@@ -51,7 +52,7 @@ pub fn destination(root: &Path, track: &OrganizableTrack) -> PathBuf {
     let filename = format!(
         "{number:0width$} {} [{}].{}",
         sanitize(&track.title),
-        track.id,
+        track.ncm_id.unwrap_or(track.id),
         safe_extension(&track.format),
         width = width
     );
@@ -186,7 +187,8 @@ mod tests {
 
     fn track(path: PathBuf) -> OrganizableTrack {
         OrganizableTrack {
-            id: 186016,
+            id: 1,
+            ncm_id: Some(186016),
             title: "晴天".into(),
             artists: "周杰伦".into(),
             album: "叶惠美".into(),

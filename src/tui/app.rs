@@ -43,7 +43,10 @@ use crate::{
     download::{
         AudioQuality, DownloadReport, DownloadRequest, DownloadSource, Downloader, TrackSelection,
     },
-    library::{Library, LibraryStats, ScanReport, Track, TrackSort, TrackView},
+    library::{
+        CatalogTrack, EnqueueOutcome, Library, LibraryStats, PlayOrigin, ScanReport, Track,
+        TrackSort, TrackView,
+    },
     lyrics::{LyricLine, Lyrics},
     organizer::MoveOutcome,
     pagination::{self, PAGE_SIZE, PaginationInfo},
@@ -151,6 +154,14 @@ impl App {
         };
         let player_state = player.as_ref().map(Player::state).unwrap_or_default();
         let lyrics_hidden = load_hide_lyrics(&services.ui_state_path);
+        let play_queue = services
+            .library
+            .queue()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<TrackRow>>();
+        let queue_index = services.library.queue_index().ok().flatten();
         let mut app = Self {
             services,
             theme: Theme::from_env(),
@@ -183,8 +194,8 @@ impl App {
             player,
             current: None,
             current_track: None,
-            play_queue: Vec::new(),
-            queue_index: None,
+            play_queue,
+            queue_index,
             play_mode: PlayMode::Sequential,
             completion_latched: false,
             expanded: false,
@@ -1356,9 +1367,20 @@ impl App {
         };
         match target {
             Target::Track(track, queue, index) => {
-                self.play_queue = queue;
-                self.queue_index = Some(index);
-                self.play(track);
+                if self.route == Route::Queue {
+                    if let Err(error) = self.set_persisted_queue_index(index) {
+                        self.status = error;
+                        return;
+                    }
+                    let current = self.play_queue.get(index).cloned().unwrap_or(track);
+                    self.play(current);
+                } else if let Err(error) = self.adopt_play_list(queue, index) {
+                    self.status = error;
+                } else if let Some(current) = self.play_queue.get(index).cloned() {
+                    self.play(current);
+                } else {
+                    self.play(track);
+                }
             }
             Target::Playlist(id, name) => {
                 if self.route == Route::Local {
@@ -1486,6 +1508,13 @@ impl App {
     }
 
     pub(super) fn play(&mut self, track: TrackRow) {
+        let track = match self.ensure_track_row(track) {
+            Ok(track) => track,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         if let Some(path) = track
             .path
             .clone()
@@ -1502,6 +1531,10 @@ impl App {
     }
 
     pub(super) fn start_stream(&mut self, track: TrackRow) {
+        let Some(song_id) = track.catalog_id() else {
+            self.status = "该曲目没有可播放的在线源".into();
+            return;
+        };
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
@@ -1510,7 +1543,6 @@ impl App {
         let discovery = self.services.discovery.clone();
         let playback_cache = self.services.playback_cache.clone();
         let tx = self.event_tx.clone();
-        let song_id = track.id;
         self.status = format!("正在连接 {}…", track.title);
         self.stream_task = Some(tokio::spawn(async move {
             let result = match PreparedStream::cached(song_id, playback_cache.clone()).await {
@@ -1540,7 +1572,10 @@ impl App {
                 self.current_track = Some(track.clone());
                 self.load_covers(&track, Some(&path));
                 self.completion_latched = false;
-                let _ = self.services.library.record_play(track.id);
+                let _ = self
+                    .services
+                    .library
+                    .record_play(track.id, PlayOrigin::Local);
                 self.load_lyrics(track);
                 self.status.clear();
             }
@@ -1552,8 +1587,9 @@ impl App {
         if let Some(task) = self.cover_task.take() {
             task.abort();
         }
-        let song_id = track.id;
-        self.cover_track = Some(song_id);
+        let library_id = track.id;
+        let catalog_id = track.catalog_id().unwrap_or(0);
+        self.cover_track = Some(library_id);
         self.cover_bytes = None;
         self.cover_player = None;
         self.cover_nav = None;
@@ -1568,7 +1604,7 @@ impl App {
         let known_url = crate::cover::nonempty_url(&track.cover_url).or_else(|| {
             self.services
                 .library
-                .track_detail(song_id)
+                .track_detail(library_id)
                 .ok()
                 .flatten()
                 .and_then(|detail| crate::cover::nonempty_url(&detail.cover_url))
@@ -1581,15 +1617,17 @@ impl App {
         let tx = self.event_tx.clone();
         self.cover_task = Some(tokio::spawn(async move {
             let Some((bytes, resolved_url)) = discovery
-                .load_cover_image(song_id, &title, &artists, &album, known_url)
+                .load_cover_image(catalog_id, &title, &artists, &album, known_url)
                 .await
             else {
                 return;
             };
-            if let Some(url) = resolved_url {
-                let _ = library.set_cover_url(song_id, &url);
+            if let Some(url) = resolved_url
+                && library_id != 0
+            {
+                let _ = library.set_cover_url(library_id, &url);
             }
-            let _ = tx.send(AppEvent::CoverLoaded(song_id, bytes));
+            let _ = tx.send(AppEvent::CoverLoaded(library_id, bytes));
         }));
     }
 
@@ -1643,7 +1681,10 @@ impl App {
                 self.current_track = Some(track.clone());
                 self.load_covers(&track, path.as_deref());
                 self.completion_latched = false;
-                let _ = self.services.library.record_play(track.id);
+                let _ = self
+                    .services
+                    .library
+                    .record_play(track.id, PlayOrigin::Stream);
                 self.load_lyrics(track);
                 self.status.clear();
             }
@@ -1707,14 +1748,16 @@ impl App {
         if let Some(task) = self.lyrics_task.take() {
             task.abort();
         }
-        let song_id = track.id;
+        let library_id = track.id;
+        let catalog_id = track.catalog_id().unwrap_or(0);
         if track.path.is_none()
-            && let Some(lyrics) = self.services.discovery.cached_lyrics(song_id)
+            && catalog_id != 0
+            && let Some(lyrics) = self.services.discovery.cached_lyrics(catalog_id)
         {
-            self.lyrics = LyricsState::Ready(song_id, lyrics);
+            self.lyrics = LyricsState::Ready(library_id, lyrics);
             return;
         }
-        self.lyrics = LyricsState::Loading(song_id);
+        self.lyrics = LyricsState::Loading(library_id);
         let discovery = self.services.discovery.clone();
         let tx = self.event_tx.clone();
         self.lyrics_task = Some(tokio::spawn(async move {
@@ -1724,8 +1767,10 @@ impl App {
             };
             let result = if let Some(lyrics) = local.clone().filter(|lyrics| !lyrics.is_empty()) {
                 Ok(lyrics)
+            } else if catalog_id == 0 {
+                Ok(local.unwrap_or_default())
             } else {
-                match discovery.lyrics(song_id).await {
+                match discovery.lyrics(catalog_id).await {
                     Ok(lyrics) if !lyrics.is_empty() => Ok(lyrics),
                     Ok(_) => Ok(local.unwrap_or_default()),
                     Err(error) => {
@@ -1739,37 +1784,45 @@ impl App {
                     }
                 }
             };
-            let _ = tx.send(AppEvent::LyricsLoaded(song_id, result));
+            let _ = tx.send(AppEvent::LyricsLoaded(library_id, result));
         }));
     }
 
     pub(super) fn next_track(&mut self, delta: isize) {
         if self.play_queue.is_empty() {
+            self.restore_play_queue();
+        }
+        if self.play_queue.is_empty() {
             let tracks = match self.focus {
                 Focus::Content => match &self.content {
-                    Content::Tracks(tracks) => Some((tracks, self.selected)),
+                    Content::Tracks(tracks) => Some((tracks.clone(), self.selected)),
                     _ => None,
                 },
                 Focus::Column(index) => self.columns.get(index).and_then(|column| {
                     if let Content::Tracks(tracks) = &column.content {
-                        Some((tracks, column.selected))
+                        Some((tracks.clone(), column.selected))
                     } else {
                         None
                     }
                 }),
                 _ => None,
             };
-            if let Some((tracks, selected)) = tracks {
-                self.play_queue = tracks.clone();
-                self.queue_index = (!tracks.is_empty()).then_some(selected.min(tracks.len() - 1));
+            if let Some((tracks, selected)) = tracks
+                && let Err(error) = self.adopt_play_list(tracks, selected)
+            {
+                self.status = error;
+                return;
             }
+        }
+        if self.queue_index.is_none() && !self.play_queue.is_empty() {
+            self.queue_index = Some(0);
         }
         let Some(index) = self.queue_index else {
             return;
         };
         let next = index.saturating_add_signed(delta);
         if next < self.play_queue.len() {
-            self.queue_index = Some(next);
+            let _ = self.set_persisted_queue_index(next);
             self.play(self.play_queue[next].clone());
         }
     }
@@ -1798,7 +1851,7 @@ impl App {
             PlayMode::Shuffle => (!self.play_queue.is_empty()).then_some(0),
         };
         if let Some(next) = next {
-            self.queue_index = Some(next);
+            let _ = self.set_persisted_queue_index(next);
             self.play(self.play_queue[next].clone());
         }
     }
@@ -2013,16 +2066,26 @@ impl App {
     }
 
     pub(super) fn favorite(&mut self) {
-        let Some(id) = self.selected_track().map(|track| track.id) else {
+        let Some(track) = self.selected_track().cloned() else {
             return;
         };
-        self.status = match self.services.library.toggle_favorite(id) {
+        let track = match self.ensure_track_row(track) {
+            Ok(track) => track,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.status = match self.services.library.toggle_favorite(track.id) {
             Ok(Some(true)) => "已喜欢".into(),
             Ok(Some(false)) => "已取消喜欢".into(),
-            Ok(None) => "请先下载该歌曲".into(),
+            Ok(None) => "无法收藏该曲目".into(),
             Err(error) => error.to_string(),
         };
-        if matches!(self.route, Route::Favorites | Route::Local) {
+        if matches!(
+            self.route,
+            Route::Favorites | Route::Local | Route::Recent | Route::Queue
+        ) {
             self.load_local();
         }
     }
@@ -2031,16 +2094,25 @@ impl App {
         let Some(track) = self.selected_track().cloned() else {
             return;
         };
-        if let Some(index) = self.queue_index
-            && !self.play_queue.iter().any(|queued| queued.id == track.id)
-        {
-            self.play_queue.insert(index + 1, track.clone());
-        }
-        self.status = match self.services.library.enqueue(track.id) {
-            Ok(true) => format!("下一首播放：{}", track.title),
-            Ok(false) => format!("已在队列：{}", track.title),
+        let track = match self.ensure_track_row(track) {
+            Ok(track) => track,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.status = match self.services.library.enqueue_next(track.id) {
+            Ok(EnqueueOutcome::Inserted) | Ok(EnqueueOutcome::Moved) => {
+                format!("下一首播放：{}", track.title)
+            }
+            Ok(EnqueueOutcome::AlreadyNext) => format!("已是下一首：{}", track.title),
+            Ok(EnqueueOutcome::Missing) => "无法加入队列".into(),
             Err(error) => error.to_string(),
         };
+        self.restore_play_queue();
+        if self.route == Route::Queue {
+            self.load_local();
+        }
     }
 
     pub(super) fn dequeue(&mut self) {
@@ -2055,7 +2127,123 @@ impl App {
             Ok(false) => String::new(),
             Err(error) => error.to_string(),
         };
+        self.restore_play_queue();
         self.load_local();
+    }
+
+    pub(super) fn clear_play_queue(&mut self) {
+        match self.services.library.clear_queue() {
+            Ok(0) => self.status = "队列已空".into(),
+            Ok(count) => {
+                self.status = format!("已清空队列 {count} 首");
+                self.push_toast(ToastKind::Success, self.status.clone());
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        }
+        self.restore_play_queue();
+        if self.route == Route::Queue {
+            self.load_local();
+        }
+    }
+
+    fn restore_play_queue(&mut self) {
+        self.play_queue = self
+            .services
+            .library
+            .queue()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        self.queue_index = self.services.library.queue_index().ok().flatten();
+    }
+
+    fn set_persisted_queue_index(&mut self, index: usize) -> Result<(), String> {
+        if self.play_queue.is_empty() {
+            self.restore_play_queue();
+        }
+        self.queue_index = (!self.play_queue.is_empty())
+            .then_some(index.min(self.play_queue.len().saturating_sub(1)));
+        self.services
+            .library
+            .set_queue_index(self.queue_index)
+            .map_err(|error| error.to_string())
+    }
+
+    fn adopt_play_list(&mut self, tracks: Vec<TrackRow>, index: usize) -> Result<(), String> {
+        let tracks = self.ensure_track_rows(tracks)?;
+        if tracks.is_empty() {
+            self.services
+                .library
+                .replace_queue(&[], None)
+                .map_err(|error| error.to_string())?;
+            self.play_queue.clear();
+            self.queue_index = None;
+            return Ok(());
+        }
+        let index = index.min(tracks.len() - 1);
+        let ids = tracks.iter().map(|track| track.id).collect::<Vec<_>>();
+        self.services
+            .library
+            .replace_queue(&ids, Some(index))
+            .map_err(|error| error.to_string())?;
+        self.play_queue = tracks;
+        self.queue_index = Some(index);
+        Ok(())
+    }
+
+    fn ensure_track_row(&self, mut track: TrackRow) -> Result<TrackRow, String> {
+        if track.id != 0 {
+            return Ok(track);
+        }
+        let catalog = catalog_from_row(&track).ok_or("无法收录缺少网易云 ID 的曲目")?;
+        track.id = self
+            .services
+            .library
+            .ensure_catalog(&catalog)
+            .map_err(|error| error.to_string())?;
+        Ok(track)
+    }
+
+    fn ensure_track_rows(&self, tracks: Vec<TrackRow>) -> Result<Vec<TrackRow>, String> {
+        let pending = tracks
+            .iter()
+            .filter(|track| track.id == 0)
+            .filter_map(catalog_from_row)
+            .collect::<Vec<_>>();
+        let assigned = if pending.is_empty() {
+            Vec::new()
+        } else {
+            self.services
+                .library
+                .ensure_catalog_many(&pending)
+                .map_err(|error| error.to_string())?
+        };
+        let mut by_ncm = HashMap::new();
+        for (catalog, id) in pending.iter().zip(assigned) {
+            by_ncm.insert(catalog.ncm_id, id);
+        }
+        Ok(tracks
+            .into_iter()
+            .map(|mut track| {
+                if track.id == 0
+                    && let Some(ncm_id) = track.ncm_id
+                {
+                    track.id = by_ncm.get(&ncm_id).copied().unwrap_or(0);
+                }
+                track
+            })
+            .collect())
+    }
+
+    pub(super) fn is_playing(&self, track: &TrackRow) -> bool {
+        self.current_track
+            .as_ref()
+            .is_some_and(|current| current.same_identity(track))
+            || self.current.is_some_and(|id| id != 0 && id == track.id)
     }
 
     pub(super) fn poll_events(&mut self) -> bool {
@@ -2595,6 +2783,17 @@ impl App {
     pub(super) fn needs_animation(&self) -> bool {
         self.needs_ui_tick() || self.needs_progress_tick()
     }
+}
+
+fn catalog_from_row(track: &TrackRow) -> Option<CatalogTrack> {
+    Some(CatalogTrack {
+        ncm_id: track.catalog_id()?,
+        title: track.title.clone(),
+        artists: track.artists.clone(),
+        album: track.album.clone(),
+        duration_ms: track.duration_ms,
+        cover_url: track.cover_url.clone(),
+    })
 }
 
 impl Drop for App {

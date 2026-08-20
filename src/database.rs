@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -14,9 +14,14 @@ use crate::organizer::OrganizableTrack;
 
 const INTERNAL_DIR: &str = ".ncm-tui";
 const DATABASE_NAME: &str = "library.sqlite3";
-const SCHEMA_VERSION: i64 = 4;
-const LOCAL_TRACK_ID_BASE: u64 = 4_000_000_000_000_000_000;
-const LOCAL_TRACK_ID_RANGE: u64 = 4_000_000_000_000_000_000;
+const SCHEMA_VERSION: i64 = 5;
+
+const TRACK_COLUMNS: &str = "id, ncm_id, source_kind, title, artists, album, file_path,
+        format, file_size, downloaded_at, duration_ms, favorite, play_count,
+        last_played_at, cover_url";
+const TRACK_COLUMNS_T: &str = "t.id, t.ncm_id, t.source_kind, t.title, t.artists, t.album,
+        t.file_path, t.format, t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
+        t.play_count, t.last_played_at, t.cover_url";
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -31,6 +36,39 @@ pub enum DatabaseError {
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayOrigin {
+    Local,
+    Stream,
+}
+
+impl PlayOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnqueueOutcome {
+    Inserted,
+    Moved,
+    AlreadyNext,
+    Missing,
+}
+
+#[derive(Clone, Debug)]
+pub struct CatalogTrack {
+    pub ncm_id: u64,
+    pub title: String,
+    pub artists: String,
+    pub album: String,
+    pub duration_ms: u64,
+    pub cover_url: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DownloadedTrack {
@@ -59,11 +97,13 @@ pub struct DownloadedTrack {
 
 #[derive(Clone, Debug)]
 pub struct LibraryTrack {
-    pub ncm_id: u64,
+    pub id: u64,
+    pub ncm_id: Option<u64>,
+    pub source_kind: String,
     pub title: String,
     pub artists: String,
     pub album: String,
-    pub file_path: PathBuf,
+    pub file_path: Option<PathBuf>,
     pub format: String,
     pub file_size: u64,
     pub downloaded_at: i64,
@@ -71,6 +111,7 @@ pub struct LibraryTrack {
     pub favorite: bool,
     pub play_count: u64,
     pub last_played_at: Option<i64>,
+    pub cover_url: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -154,197 +195,52 @@ impl LibraryDb {
 
     fn migrate(&self) -> Result<()> {
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
+        connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL);
              INSERT INTO schema_meta(version)
-             SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);
-
-             CREATE TABLE IF NOT EXISTS tracks (
-                 ncm_id          INTEGER PRIMARY KEY,
-                 title           TEXT NOT NULL,
-                 artists         TEXT NOT NULL,
-                 album_id        INTEGER,
-                 album           TEXT NOT NULL DEFAULT '',
-                 duration_ms     INTEGER NOT NULL DEFAULT 0,
-                 album_artist    TEXT NOT NULL DEFAULT '',
-                 release_year    INTEGER,
-                 track_number    INTEGER,
-                 disc_number     INTEGER,
-                 total_tracks    INTEGER,
-                 cover_url       TEXT NOT NULL DEFAULT '',
-                 file_path       TEXT NOT NULL UNIQUE,
-                 file_size       INTEGER NOT NULL DEFAULT 0,
-                 format          TEXT NOT NULL DEFAULT '',
-                 bitrate         INTEGER NOT NULL DEFAULT 0,
-                 audio_md5       TEXT NOT NULL DEFAULT '',
-                 status          TEXT NOT NULL DEFAULT 'available',
-                 downloaded_at   INTEGER NOT NULL,
-                 updated_at      INTEGER NOT NULL,
-                 source_kind     TEXT NOT NULL DEFAULT 'ncm',
-                 source_id       TEXT NOT NULL DEFAULT '',
-                 favorite        INTEGER NOT NULL DEFAULT 0,
-                 play_count      INTEGER NOT NULL DEFAULT 0,
-                 last_played_at  INTEGER
-             );
-
-             CREATE TABLE IF NOT EXISTS collections (
-                 kind             TEXT NOT NULL,
-                 ncm_id           INTEGER NOT NULL,
-                 name             TEXT NOT NULL,
-                 updated_at       INTEGER NOT NULL,
-                 PRIMARY KEY(kind, ncm_id)
-             ) WITHOUT ROWID;
-
-             CREATE TABLE IF NOT EXISTS collection_tracks (
-                 collection_kind  TEXT NOT NULL,
-                 collection_id    INTEGER NOT NULL,
-                 track_id         INTEGER NOT NULL,
-                 position         INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY(collection_kind, collection_id, track_id),
-                 FOREIGN KEY(track_id) REFERENCES tracks(ncm_id) ON DELETE CASCADE
-             ) WITHOUT ROWID;
-
-             CREATE INDEX IF NOT EXISTS idx_tracks_downloaded
-                 ON tracks(status, downloaded_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_tracks_available_title
-                 ON tracks(title COLLATE NOCASE, ncm_id) WHERE status='available';
-             CREATE INDEX IF NOT EXISTS idx_tracks_album
-                 ON tracks(album_id, ncm_id);
-             CREATE INDEX IF NOT EXISTS idx_tracks_artists
-                 ON tracks(artists COLLATE NOCASE, title COLLATE NOCASE);
-             CREATE INDEX IF NOT EXISTS idx_collection_tracks_track
-                 ON collection_tracks(track_id);
-
-             CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
-                 title, artists, album,
-                 content='tracks', content_rowid='ncm_id',
-                 tokenize='unicode61 remove_diacritics 2'
-             );
-
-             CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
-                 INSERT INTO tracks_fts(rowid, title, artists, album)
-                 VALUES (new.ncm_id, new.title, new.artists, new.album);
-             END;
-             CREATE TRIGGER IF NOT EXISTS tracks_ad AFTER DELETE ON tracks BEGIN
-                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artists, album)
-                 VALUES ('delete', old.ncm_id, old.title, old.artists, old.album);
-             END;
-
-             CREATE TABLE IF NOT EXISTS maintenance_state (
-                 singleton       INTEGER PRIMARY KEY CHECK(singleton=1),
-                 downloads_since INTEGER NOT NULL DEFAULT 0,
-                 last_run_at     INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT OR IGNORE INTO maintenance_state(singleton) VALUES(1);",
+             SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_meta);",
         )?;
+        let has_tracks = table_exists(&connection, "tracks")?;
+        let has_surrogate = has_tracks && table_has_column(&connection, "tracks", "id")?;
+        if !has_tracks {
+            let transaction = connection.transaction()?;
+            create_v5_schema(&transaction)?;
+            transaction.execute("UPDATE schema_meta SET version=?1", [SCHEMA_VERSION])?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        if !has_surrogate {
+            connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+            let transaction = connection.transaction()?;
+            ensure_legacy_columns(&transaction)?;
+            migrate_legacy_to_v5(&transaction)?;
+            transaction.execute("UPDATE schema_meta SET version=?1", [SCHEMA_VERSION])?;
+            transaction.commit()?;
+            connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+            return Ok(());
+        }
         let version: i64 =
-            transaction.query_row("SELECT MAX(version) FROM schema_meta", [], |row| row.get(0))?;
-        if !table_has_column(&transaction, "tracks", "source_kind")? {
-            transaction.execute_batch(
-                "ALTER TABLE tracks ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'ncm';
-                 ALTER TABLE tracks ADD COLUMN source_id TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE tracks ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE tracks ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE tracks ADD COLUMN last_played_at INTEGER;",
-            )?;
+            connection.query_row("SELECT MAX(version) FROM schema_meta", [], |row| row.get(0))?;
+        if version < SCHEMA_VERSION {
+            connection.execute("UPDATE schema_meta SET version=?1", [SCHEMA_VERSION])?;
         }
-        for (column, definition) in [
-            ("album_artist", "TEXT NOT NULL DEFAULT ''"),
-            ("release_year", "INTEGER"),
-            ("track_number", "INTEGER"),
-            ("disc_number", "INTEGER"),
-            ("total_tracks", "INTEGER"),
-            ("cover_url", "TEXT NOT NULL DEFAULT ''"),
-        ] {
-            if !table_has_column(&transaction, "tracks", column)? {
-                transaction.execute(
-                    &format!("ALTER TABLE tracks ADD COLUMN {column} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        transaction.execute_batch(
-            "DROP TRIGGER IF EXISTS tracks_au;
-             CREATE TRIGGER tracks_au AFTER UPDATE OF title, artists, album ON tracks BEGIN
-                 INSERT INTO tracks_fts(tracks_fts, rowid, title, artists, album)
-                 VALUES ('delete', old.ncm_id, old.title, old.artists, old.album);
-                 INSERT INTO tracks_fts(rowid, title, artists, album)
-                 VALUES (new.ncm_id, new.title, new.artists, new.album);
-             END;
-
-             CREATE TABLE IF NOT EXISTS media_locations (
-                 track_id      INTEGER NOT NULL,
-                 filepath      TEXT NOT NULL UNIQUE,
-                 format        TEXT NOT NULL DEFAULT '',
-                 file_size     INTEGER NOT NULL DEFAULT 0,
-                 modified_ns   INTEGER NOT NULL DEFAULT 0,
-                 is_present    INTEGER NOT NULL DEFAULT 1,
-                 first_seen_at INTEGER NOT NULL,
-                 last_seen_at  INTEGER NOT NULL,
-                 PRIMARY KEY(track_id, filepath),
-                 FOREIGN KEY(track_id) REFERENCES tracks(ncm_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_media_locations_present
-                 ON media_locations(is_present, track_id);
-
-             CREATE TABLE IF NOT EXISTS playback_queue (
-                 position    INTEGER PRIMARY KEY,
-                 track_id    INTEGER NOT NULL UNIQUE,
-                 enqueued_at INTEGER NOT NULL,
-                 FOREIGN KEY(track_id) REFERENCES tracks(ncm_id) ON DELETE CASCADE
-             );
-
-             CREATE TABLE IF NOT EXISTS playback_history (
-                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                 track_id  INTEGER NOT NULL,
-                 played_at INTEGER NOT NULL,
-                 FOREIGN KEY(track_id) REFERENCES tracks(ncm_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_playback_history_recent
-                 ON playback_history(played_at DESC, id DESC);
-
-             CREATE TABLE IF NOT EXISTS lifecycle_events (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 entity_kind TEXT NOT NULL,
-                 entity_id   TEXT NOT NULL DEFAULT '',
-                 action      TEXT NOT NULL,
-                 detail      TEXT NOT NULL DEFAULT '',
-                 created_at  INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_lifecycle_events_recent
-                 ON lifecycle_events(created_at DESC, id DESC);
-
-             INSERT OR IGNORE INTO media_locations(
-                 track_id, filepath, format, file_size, modified_ns,
-                 is_present, first_seen_at, last_seen_at
-             )
-             SELECT ncm_id, file_path, format, file_size, 0,
-                    status='available', downloaded_at, updated_at
-             FROM tracks;",
-        )?;
-        if version < 2 {
-            // Existing databases may have an external-content FTS table with no initial index.
-            transaction.execute("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')", [])?;
-        }
-        transaction.execute("UPDATE schema_meta SET version=?1", [SCHEMA_VERSION])?;
-        transaction.commit()?;
         Ok(())
     }
 
-    /// Incrementally records one successful download in a single transaction.
     pub fn record_download(&self, track: &DownloadedTrack) -> Result<()> {
         let now = unix_timestamp();
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO tracks (
-                 ncm_id, title, artists, album_id, album, duration_ms,
-                 album_artist, release_year, track_number, disc_number,
-                 total_tracks, cover_url, file_path, file_size, format,
-                 bitrate, audio_md5, status, downloaded_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                       ?13, ?14, ?15, ?16, ?17, 'available', ?18, ?18)
+                 ncm_id, source_kind, source_id, title, artists, album_id, album,
+                 duration_ms, album_artist, release_year, track_number, disc_number,
+                 total_tracks, cover_url, file_path, file_size, format, bitrate,
+                 audio_md5, status, downloaded_at, created_at, updated_at
+             ) VALUES (
+                 ?1, 'ncm', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, ?18, 'available', ?19, ?19, ?19
+             )
              ON CONFLICT(ncm_id) DO UPDATE SET
                  title=excluded.title,
                  artists=excluded.artists,
@@ -363,9 +259,11 @@ impl LibraryDb {
                  bitrate=excluded.bitrate,
                  audio_md5=excluded.audio_md5,
                  status='available',
+                 downloaded_at=COALESCE(tracks.downloaded_at, excluded.downloaded_at),
                  updated_at=excluded.updated_at",
             params![
                 track.ncm_id as i64,
+                track.ncm_id.to_string(),
                 track.title,
                 track.artists,
                 track.album_id.map(|id| id as i64),
@@ -385,6 +283,11 @@ impl LibraryDb {
                 now,
             ],
         )?;
+        let track_id: i64 = transaction.query_row(
+            "SELECT id FROM tracks WHERE ncm_id=?1",
+            [track.ncm_id as i64],
+            |row| row.get(0),
+        )?;
         transaction.execute(
             "INSERT INTO media_locations(
                  track_id, filepath, format, file_size, modified_ns,
@@ -395,7 +298,7 @@ impl LibraryDb {
                  file_size=excluded.file_size, is_present=1,
                  last_seen_at=excluded.last_seen_at",
             params![
-                track.ncm_id as i64,
+                track_id,
                 track.file_path.to_string_lossy(),
                 track.format,
                 track.file_size as i64,
@@ -423,7 +326,7 @@ impl LibraryDb {
                 params![
                     track.collection_kind,
                     collection_id as i64,
-                    track.ncm_id as i64,
+                    track_id,
                     track.collection_position as i64
                 ],
             )?;
@@ -436,6 +339,74 @@ impl LibraryDb {
         drop(connection);
         self.run_incremental_maintenance()?;
         Ok(())
+    }
+
+    pub fn ensure_catalog(&self, track: &CatalogTrack) -> Result<u64> {
+        Ok(*self
+            .ensure_catalog_many(std::slice::from_ref(track))?
+            .first()
+            .unwrap_or(&0))
+    }
+
+    pub fn ensure_catalog_many(&self, tracks: &[CatalogTrack]) -> Result<Vec<u64>> {
+        if tracks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = unix_timestamp();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut ids = Vec::with_capacity(tracks.len());
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO tracks (
+                     ncm_id, source_kind, source_id, title, artists, album,
+                     duration_ms, cover_url, status, created_at, updated_at
+                 ) VALUES (?1, 'ncm', ?2, ?3, ?4, ?5, ?6, ?7, 'remote', ?8, ?8)
+                 ON CONFLICT(ncm_id) DO UPDATE SET
+                     title=excluded.title,
+                     artists=excluded.artists,
+                     album=CASE WHEN excluded.album<>'' THEN excluded.album ELSE tracks.album END,
+                     duration_ms=CASE WHEN excluded.duration_ms>0 THEN excluded.duration_ms ELSE tracks.duration_ms END,
+                     cover_url=CASE WHEN excluded.cover_url<>'' THEN excluded.cover_url ELSE tracks.cover_url END,
+                     updated_at=excluded.updated_at
+                 RETURNING id",
+            )?;
+            for track in tracks {
+                if track.ncm_id == 0 {
+                    ids.push(0);
+                    continue;
+                }
+                let id: i64 = statement.query_row(
+                    params![
+                        track.ncm_id as i64,
+                        track.ncm_id.to_string(),
+                        track.title,
+                        track.artists,
+                        track.album,
+                        track.duration_ms as i64,
+                        track.cover_url,
+                        now,
+                    ],
+                    |row| row.get(0),
+                )?;
+                ids.push(id as u64);
+            }
+        }
+        transaction.commit()?;
+        Ok(ids)
+    }
+
+    #[cfg(test)]
+    pub fn id_by_ncm(&self, ncm_id: u64) -> Result<Option<u64>> {
+        let connection = self.lock()?;
+        let id: Option<i64> = connection
+            .query_row(
+                "SELECT id FROM tracks WHERE ncm_id=?1",
+                [ncm_id as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id.map(|id| id as u64))
     }
 
     pub fn record_collection_membership(
@@ -462,15 +433,15 @@ impl LibraryDb {
             let mut statement = transaction.prepare_cached(
                 "INSERT INTO collection_tracks(
                      collection_kind, collection_id, track_id, position
-                 ) SELECT ?1, ?2, ?3, ?4
-                   WHERE EXISTS(SELECT 1 FROM tracks WHERE ncm_id=?3)
+                 ) SELECT ?1, ?2, id, ?4
+                   FROM tracks WHERE ncm_id=?3
                  ON CONFLICT DO UPDATE SET position=excluded.position",
             )?;
-            for (track_id, position) in tracks {
+            for (ncm_id, position) in tracks {
                 statement.execute(params![
                     kind,
                     collection_id as i64,
-                    *track_id as i64,
+                    *ncm_id as i64,
                     *position as i64
                 ])?;
             }
@@ -479,23 +450,24 @@ impl LibraryDb {
         Ok(())
     }
 
-    pub fn available_path(&self, ncm_id: u64) -> Result<Option<PathBuf>> {
+    pub fn available_path(&self, track_id: u64) -> Result<Option<PathBuf>> {
         let connection = self.lock()?;
         let path: Option<String> = connection
             .prepare_cached(
                 "SELECT file_path FROM tracks
-                 WHERE ncm_id=?1 AND status='available'",
+                 WHERE id=?1 AND status='available'",
             )?
-            .query_row([ncm_id as i64], |row| row.get(0))
-            .optional()?;
+            .query_row([track_id as i64], |row| row.get(0))
+            .optional()?
+            .flatten();
         drop(connection);
         match path.map(PathBuf::from) {
             Some(path) if path.is_file() => Ok(Some(path)),
             Some(_) => {
                 let connection = self.lock()?;
                 connection.execute(
-                    "UPDATE tracks SET status='missing', updated_at=?1 WHERE ncm_id=?2",
-                    params![unix_timestamp(), ncm_id as i64],
+                    "UPDATE tracks SET status='missing', updated_at=?1 WHERE id=?2",
+                    params![unix_timestamp(), track_id as i64],
                 )?;
                 Ok(None)
             }
@@ -504,12 +476,12 @@ impl LibraryDb {
     }
 
     /// Resolves a whole plan in one indexed query instead of one lookup per track.
-    pub fn available_ids(&self, ids: &[u64]) -> Result<std::collections::HashSet<u64>> {
+    pub fn available_ids(&self, ncm_ids: &[u64]) -> Result<HashSet<u64>> {
         use rusqlite::params_from_iter;
-        let mut found = std::collections::HashSet::new();
+        let mut found = HashSet::new();
         let mut connection = self.lock()?;
         let mut missing = Vec::new();
-        for chunk in ids.chunks(500) {
+        for chunk in ncm_ids.chunks(500) {
             if chunk.is_empty() {
                 continue;
             }
@@ -517,16 +489,25 @@ impl LibraryDb {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT ncm_id, file_path FROM tracks WHERE status='available' AND ncm_id IN ({placeholders})"
+                "SELECT ncm_id, file_path FROM tracks
+                 WHERE status='available' AND ncm_id IN ({placeholders})"
             );
             let mut statement = connection.prepare(&sql)?;
-            let rows = statement
-                .query_map(params_from_iter(chunk.iter().map(|id| *id as i64)), |row| {
-                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
-                })?;
+            let rows = statement.query_map(
+                params_from_iter(chunk.iter().map(|id| *id as i64)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )?;
             for row in rows {
                 let (id, path) = row?;
-                if Path::new(&path).is_file() {
+                if path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_file())
+                {
                     found.insert(id);
                 } else {
                     missing.push(id);
@@ -551,15 +532,14 @@ impl LibraryDb {
 
     pub fn recent(&self, limit: usize) -> Result<Vec<LibraryTrack>> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, file_path, format,
-                    file_size, downloaded_at, duration_ms, favorite, play_count,
-                    last_played_at
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS}
              FROM tracks
              WHERE status='available'
-             ORDER BY downloaded_at DESC, ncm_id DESC
-             LIMIT ?1",
-        )?;
+             ORDER BY COALESCE(downloaded_at, created_at) DESC, id DESC
+             LIMIT ?1"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([limit as i64], map_library_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -574,31 +554,29 @@ impl LibraryDb {
             .collect::<Vec<_>>()
             .join(" AND ");
         let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path,
-                    t.format, t.file_size, t.downloaded_at, t.duration_ms,
-                    t.favorite, t.play_count, t.last_played_at
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS_T}
              FROM tracks_fts f
-             JOIN tracks t ON t.ncm_id=f.rowid
+             JOIN tracks t ON t.id=f.rowid
              WHERE tracks_fts MATCH ?1 AND t.status='available'
              ORDER BY bm25(tracks_fts, 5.0, 3.0, 1.0), t.downloaded_at DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params![fts_query, limit as i64], map_library_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn list(&self, favorites_only: bool, limit: usize) -> Result<Vec<LibraryTrack>> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, file_path, format,
-                    file_size, downloaded_at, duration_ms, favorite, play_count,
-                    last_played_at
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS}
              FROM tracks
              WHERE status='available' AND (?1=0 OR favorite=1)
-             ORDER BY title COLLATE NOCASE, artists COLLATE NOCASE, ncm_id
-             LIMIT ?2",
-        )?;
+             ORDER BY title COLLATE NOCASE, artists COLLATE NOCASE, id
+             LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(params![favorites_only, limit as i64], map_library_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -635,14 +613,14 @@ impl LibraryDb {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE tracks SET favorite=NOT favorite, updated_at=?1 WHERE ncm_id=?2",
+            "UPDATE tracks SET favorite=NOT favorite, updated_at=?1 WHERE id=?2",
             params![now, track_id as i64],
         )?;
         if changed == 0 {
             return Ok(None);
         }
         let favorite: bool = transaction.query_row(
-            "SELECT favorite FROM tracks WHERE ncm_id=?1",
+            "SELECT favorite FROM tracks WHERE id=?1",
             [track_id as i64],
             |row| row.get(0),
         )?;
@@ -658,49 +636,141 @@ impl LibraryDb {
         Ok(Some(favorite))
     }
 
-    pub fn enqueue(&self, track_id: u64) -> Result<bool> {
+    pub fn replace_queue(&self, track_ids: &[u64], current_index: Option<usize>) -> Result<()> {
         let now = unix_timestamp();
+        let index = current_index
+            .filter(|index| *index < track_ids.len())
+            .map(|index| index as i64);
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let changed = transaction.execute(
-            "INSERT OR IGNORE INTO playback_queue(position, track_id, enqueued_at)
-             SELECT next_position, ?1, ?2
-             FROM (SELECT COALESCE(MAX(position), 0)+1 AS next_position FROM playback_queue)
-             WHERE EXISTS(SELECT 1 FROM tracks WHERE ncm_id=?1 AND status='available')",
-            params![track_id as i64, now],
-        )?;
-        if changed != 0 {
-            record_event(&transaction, "track", track_id, "enqueue", "", now)?;
+        transaction.execute("DELETE FROM playback_queue", [])?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO playback_queue(position, track_id, enqueued_at)
+                 SELECT ?1, id, ?3 FROM tracks WHERE id=?2",
+            )?;
+            for (position, track_id) in track_ids.iter().enumerate() {
+                statement.execute(params![position as i64, *track_id as i64, now])?;
+            }
         }
+        transaction.execute(
+            "UPDATE playback_state SET current_index=?1, updated_at=?2 WHERE singleton=1",
+            params![index, now],
+        )?;
+        record_event(
+            &transaction,
+            "queue",
+            0,
+            "replace",
+            &track_ids.len().to_string(),
+            now,
+        )?;
         transaction.commit()?;
-        Ok(changed != 0)
+        Ok(())
+    }
+
+    pub fn enqueue_next(&self, track_id: u64) -> Result<EnqueueOutcome> {
+        if !self.track_exists(track_id)? {
+            return Ok(EnqueueOutcome::Missing);
+        }
+        let mut ids = self.queue_ids()?;
+        let mut current = self.queue_index()?;
+        if let Some(position) = ids.iter().position(|id| *id == track_id) {
+            match current {
+                Some(index) if index == position || position == index + 1 => {
+                    return Ok(EnqueueOutcome::AlreadyNext);
+                }
+                None => return Ok(EnqueueOutcome::AlreadyNext),
+                Some(_) => {}
+            }
+            ids.remove(position);
+            if let Some(index) = current.as_mut()
+                && position < *index
+            {
+                *index -= 1;
+            }
+            let insert_at = current.map(|index| index + 1).unwrap_or(ids.len());
+            ids.insert(insert_at.min(ids.len()), track_id);
+            self.replace_queue(&ids, current)?;
+            return Ok(EnqueueOutcome::Moved);
+        }
+        let insert_at = current.map(|index| index + 1).unwrap_or(ids.len());
+        ids.insert(insert_at.min(ids.len()), track_id);
+        self.replace_queue(&ids, current)?;
+        Ok(EnqueueOutcome::Inserted)
     }
 
     pub fn dequeue(&self, track_id: u64) -> Result<bool> {
-        let now = unix_timestamp();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
-        let changed = transaction.execute(
-            "DELETE FROM playback_queue WHERE track_id=?1",
-            [track_id as i64],
-        )?;
-        if changed != 0 {
-            record_event(&transaction, "track", track_id, "dequeue", "", now)?;
+        let mut ids = self.queue_ids()?;
+        let Some(position) = ids.iter().position(|id| *id == track_id) else {
+            return Ok(false);
+        };
+        let mut current = self.queue_index()?;
+        ids.remove(position);
+        if let Some(index) = current.as_mut() {
+            if position < *index {
+                *index -= 1;
+            } else if position == *index {
+                if ids.is_empty() {
+                    current = None;
+                } else if *index >= ids.len() {
+                    current = Some(ids.len() - 1);
+                }
+            }
         }
-        transaction.commit()?;
-        Ok(changed != 0)
+        self.replace_queue(&ids, current)?;
+        Ok(true)
     }
 
     pub fn clear_queue(&self) -> Result<usize> {
-        let now = unix_timestamp();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
-        let changed = transaction.execute("DELETE FROM playback_queue", [])?;
-        if changed != 0 {
-            record_event(&transaction, "queue", 0, "clear", "", now)?;
-        }
-        transaction.commit()?;
-        Ok(changed)
+        let count = self.queue_ids()?.len();
+        self.replace_queue(&[], None)?;
+        Ok(count)
+    }
+
+    pub fn queue_index(&self) -> Result<Option<usize>> {
+        let connection = self.lock()?;
+        let index: Option<i64> = connection.query_row(
+            "SELECT current_index FROM playback_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(index
+            .filter(|index| *index >= 0)
+            .map(|index| index as usize))
+    }
+
+    pub fn set_queue_index(&self, index: Option<usize>) -> Result<()> {
+        let connection = self.lock()?;
+        connection.execute(
+            "UPDATE playback_state SET current_index=?1, updated_at=?2 WHERE singleton=1",
+            params![index.map(|index| index as i64), unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    fn queue_ids(&self) -> Result<Vec<u64>> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare_cached("SELECT track_id FROM playback_queue ORDER BY position")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|id| id as u64)
+            .collect())
+    }
+
+    fn track_exists(&self, track_id: u64) -> Result<bool> {
+        let connection = self.lock()?;
+        let found: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM tracks WHERE id=?1",
+                [track_id as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     pub fn albums(&self) -> Result<Vec<(String, String, u64, u64)>> {
@@ -743,33 +813,29 @@ impl LibraryDb {
     }
 
     pub fn list_by_album(&self, album: &str, limit: usize) -> Result<Vec<LibraryTrack>> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, file_path, format,
-                    file_size, downloaded_at, duration_ms, favorite, play_count,
-                    last_played_at
-             FROM tracks
-             WHERE status='available' AND album=?1 COLLATE NOCASE
-             ORDER BY disc_number, track_number, title COLLATE NOCASE, ncm_id
-             LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![album, limit as i64], map_library_track)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        self.query_tracks(
+            &format!(
+                "SELECT {TRACK_COLUMNS}
+                 FROM tracks
+                 WHERE status='available' AND album=?1 COLLATE NOCASE
+                 ORDER BY disc_number, track_number, title COLLATE NOCASE, id
+                 LIMIT ?2"
+            ),
+            params![album, limit as i64],
+        )
     }
 
     pub fn list_by_artist(&self, artists: &str, limit: usize) -> Result<Vec<LibraryTrack>> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, file_path, format,
-                    file_size, downloaded_at, duration_ms, favorite, play_count,
-                    last_played_at
-             FROM tracks
-             WHERE status='available' AND artists=?1 COLLATE NOCASE
-             ORDER BY album COLLATE NOCASE, disc_number, track_number, ncm_id
-             LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![artists, limit as i64], map_library_track)?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        self.query_tracks(
+            &format!(
+                "SELECT {TRACK_COLUMNS}
+                 FROM tracks
+                 WHERE status='available' AND artists=?1 COLLATE NOCASE
+                 ORDER BY album COLLATE NOCASE, disc_number, track_number, id
+                 LIMIT ?2"
+            ),
+            params![artists, limit as i64],
+        )
     }
 
     pub fn list_view(
@@ -791,22 +857,24 @@ impl LibraryDb {
             crate::library::TrackView::Large => "status='available' AND file_size>=31457280",
         };
         let order = match (view, sort) {
-            (crate::library::TrackView::RecentAdded, _) => "downloaded_at DESC, ncm_id DESC",
+            (crate::library::TrackView::RecentAdded, _) => {
+                "COALESCE(downloaded_at, created_at) DESC, id DESC"
+            }
             (_, crate::library::TrackSort::Title) => {
-                "title COLLATE NOCASE, artists COLLATE NOCASE, ncm_id"
+                "title COLLATE NOCASE, artists COLLATE NOCASE, id"
             }
-            (_, crate::library::TrackSort::RecentAdded) => "downloaded_at DESC, ncm_id DESC",
+            (_, crate::library::TrackSort::RecentAdded) => {
+                "COALESCE(downloaded_at, created_at) DESC, id DESC"
+            }
             (_, crate::library::TrackSort::RecentPlayed) => {
-                "last_played_at DESC, play_count DESC, ncm_id DESC"
+                "last_played_at DESC, play_count DESC, id DESC"
             }
-            (_, crate::library::TrackSort::MostPlayed) => "play_count DESC, ncm_id DESC",
-            (_, crate::library::TrackSort::Duration) => "duration_ms DESC, ncm_id",
-            (_, crate::library::TrackSort::Size) => "file_size DESC, ncm_id",
+            (_, crate::library::TrackSort::MostPlayed) => "play_count DESC, id DESC",
+            (_, crate::library::TrackSort::Duration) => "duration_ms DESC, id",
+            (_, crate::library::TrackSort::Size) => "file_size DESC, id",
         };
         let sql = format!(
-            "SELECT ncm_id, title, artists, album, file_path, format,
-                    file_size, downloaded_at, duration_ms, favorite, play_count,
-                    last_played_at
+            "SELECT {TRACK_COLUMNS}
              FROM tracks
              WHERE {filter}
              ORDER BY {order}
@@ -845,17 +913,16 @@ impl LibraryDb {
         collection_id: u64,
         limit: usize,
     ) -> Result<Vec<LibraryTrack>> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path, t.format,
-                    t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
-                    t.play_count, t.last_played_at
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS_T}
              FROM collection_tracks c
-             JOIN tracks t ON t.ncm_id=c.track_id
+             JOIN tracks t ON t.id=c.track_id
              WHERE c.collection_kind=?1 AND c.collection_id=?2 AND t.status='available'
-             ORDER BY c.position, t.ncm_id
-             LIMIT ?3",
-        )?;
+             ORDER BY c.position, t.id
+             LIMIT ?3"
+        );
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
             params![kind, collection_id as i64, limit as i64],
             map_library_track,
@@ -865,24 +932,23 @@ impl LibraryDb {
 
     pub fn history(&self, limit: usize) -> Result<Vec<(LibraryTrack, i64)>> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path, t.format,
-                    t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
-                    t.play_count, t.last_played_at, h.played_at
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS_T}, h.played_at
              FROM playback_history h
-             JOIN tracks t ON t.ncm_id=h.track_id
+             JOIN tracks t ON t.id=h.track_id
              ORDER BY h.played_at DESC, h.id DESC
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([limit as i64], |row| {
-            Ok((map_library_track(row)?, row.get::<_, i64>(12)?))
+            Ok((map_library_track(row)?, row.get::<_, i64>(15)?))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn set_cover_url(&self, track_id: u64, cover_url: &str) -> Result<bool> {
         let changed = self.lock()?.execute(
-            "UPDATE tracks SET cover_url=?1, updated_at=?2 WHERE ncm_id=?3",
+            "UPDATE tracks SET cover_url=?1, updated_at=?2 WHERE id=?3",
             params![cover_url, unix_timestamp(), track_id as i64],
         )?;
         Ok(changed > 0)
@@ -894,7 +960,7 @@ impl LibraryDb {
             .query_row(
                 "SELECT album_artist, release_year, track_number, disc_number,
                         bitrate, audio_md5, cover_url
-                 FROM tracks WHERE ncm_id=?1",
+                 FROM tracks WHERE id=?1",
                 [track_id as i64],
                 |row| {
                     Ok(TrackDetail {
@@ -913,38 +979,39 @@ impl LibraryDb {
     }
 
     pub fn queue(&self) -> Result<Vec<LibraryTrack>> {
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS_T}
+             FROM playback_queue q JOIN tracks t ON t.id=q.track_id
+             ORDER BY q.position"
+        );
         let connection = self.lock()?;
-        let mut statement = connection.prepare_cached(
-            "SELECT t.ncm_id, t.title, t.artists, t.album, t.file_path, t.format,
-                    t.file_size, t.downloaded_at, t.duration_ms, t.favorite,
-                    t.play_count, t.last_played_at
-             FROM playback_queue q JOIN tracks t ON t.ncm_id=q.track_id
-             WHERE t.status='available'
-             ORDER BY q.position",
-        )?;
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([], map_library_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub fn record_play(&self, track_id: u64) -> Result<bool> {
+    pub fn record_play(&self, track_id: u64, origin: PlayOrigin) -> Result<bool> {
         let now = unix_timestamp();
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE tracks SET play_count=play_count+1, last_played_at=?1, updated_at=?1
-             WHERE ncm_id=?2 AND status='available'",
+             WHERE id=?2",
             params![now, track_id as i64],
         )?;
         if changed != 0 {
             transaction.execute(
-                "INSERT INTO playback_history(track_id, played_at) VALUES(?1, ?2)",
-                params![track_id as i64, now],
+                "INSERT INTO playback_history(track_id, played_at, origin) VALUES(?1, ?2, ?3)",
+                params![track_id as i64, now, origin.as_str()],
             )?;
-            transaction.execute(
-                "DELETE FROM playback_queue WHERE track_id=?1",
-                [track_id as i64],
+            record_event(
+                &transaction,
+                "track",
+                track_id,
+                "play",
+                origin.as_str(),
+                now,
             )?;
-            record_event(&transaction, "track", track_id, "play", "", now)?;
         }
         transaction.commit()?;
         Ok(changed != 0)
@@ -954,10 +1021,10 @@ impl LibraryDb {
         let connection = self.lock()?;
         connection
             .prepare_cached(
-                "SELECT ncm_id, title, artists, album, album_artist, track_number,
+                "SELECT id, ncm_id, title, artists, album, album_artist, track_number,
                         disc_number, total_tracks, format, file_path
                  FROM tracks
-                 WHERE ncm_id=?1 AND status='available' AND source_kind='ncm'",
+                 WHERE id=?1 AND status='available' AND source_kind='ncm'",
             )?
             .query_row([track_id as i64], map_organizable_track)
             .optional()
@@ -967,11 +1034,11 @@ impl LibraryDb {
     pub fn organizable_album(&self, album_id: u64) -> Result<Vec<OrganizableTrack>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, album_artist, track_number,
+            "SELECT id, ncm_id, title, artists, album, album_artist, track_number,
                     disc_number, total_tracks, format, file_path
              FROM tracks
              WHERE album_id=?1 AND status='available' AND source_kind='ncm'
-             ORDER BY COALESCE(disc_number, 1), COALESCE(track_number, 0), ncm_id",
+             ORDER BY COALESCE(disc_number, 1), COALESCE(track_number, 0), id",
         )?;
         let rows = statement.query_map([album_id as i64], map_organizable_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -980,12 +1047,12 @@ impl LibraryDb {
     pub fn organizable_all(&self) -> Result<Vec<OrganizableTrack>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare_cached(
-            "SELECT ncm_id, title, artists, album, album_artist, track_number,
+            "SELECT id, ncm_id, title, artists, album, album_artist, track_number,
                     disc_number, total_tracks, format, file_path
              FROM tracks
              WHERE status='available' AND source_kind='ncm'
              ORDER BY album_artist COLLATE NOCASE, album COLLATE NOCASE,
-                      COALESCE(disc_number, 1), COALESCE(track_number, 0), ncm_id",
+                      COALESCE(disc_number, 1), COALESCE(track_number, 0), id",
         )?;
         let rows = statement.query_map([], map_organizable_track)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1006,7 +1073,7 @@ impl LibraryDb {
         let changed = transaction.execute(
             "UPDATE tracks
              SET file_path=?1, file_size=?2, status='available', updated_at=?3
-             WHERE ncm_id=?4 AND source_kind='ncm' AND file_path=?5",
+             WHERE id=?4 AND source_kind='ncm' AND file_path=?5",
             params![new, file_size as i64, now, track_id as i64, old],
         )?;
         if changed != 0 {
@@ -1035,7 +1102,6 @@ impl LibraryDb {
         let transaction = connection.transaction()?;
         let mut changes = ScanChanges::default();
         let mut seen = HashSet::with_capacity(files.len());
-        let mut allocated = HashMap::new();
 
         for file in files {
             let path = file.path.to_string_lossy().into_owned();
@@ -1061,7 +1127,7 @@ impl LibraryDb {
                          file_path=?5, file_size=?6, format=?7, album_artist=?8,
                          release_year=?9, track_number=?10, disc_number=?11, bitrate=?12,
                          status='available', updated_at=?13
-                     WHERE ncm_id=?14 AND source_kind='local'",
+                     WHERE id=?14 AND source_kind='local'",
                     params![
                         file.title,
                         file.artists,
@@ -1099,7 +1165,7 @@ impl LibraryDb {
                     )?;
                     transaction.execute(
                         "UPDATE tracks SET file_path=?1, file_size=?2, format=?3,
-                             status='available', updated_at=?4 WHERE ncm_id=?5",
+                             status='available', updated_at=?4 WHERE id=?5",
                         params![path, file.file_size as i64, file.format, now, track_id],
                     )?;
                     changes.updated += 1;
@@ -1108,50 +1174,49 @@ impl LibraryDb {
             }
 
             let migrated_track = transaction
-                .query_row(
-                    "SELECT ncm_id FROM tracks WHERE file_path=?1",
-                    [&path],
-                    |row| row.get::<_, i64>(0),
-                )
+                .query_row("SELECT id FROM tracks WHERE file_path=?1", [&path], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .optional()?;
             let track_id = match migrated_track {
-                Some(track_id) => track_id,
-                None => allocate_local_track_id(&transaction, &path, &mut allocated)?,
+                Some(track_id) => {
+                    transaction.execute(
+                        "UPDATE tracks SET status='available', file_size=?1, format=?2,
+                             updated_at=?3 WHERE id=?4",
+                        params![file.file_size as i64, file.format, now, track_id],
+                    )?;
+                    track_id
+                }
+                None => {
+                    transaction.execute(
+                        "INSERT INTO tracks(
+                             ncm_id, title, artists, album, duration_ms, file_path, file_size,
+                             format, album_artist, release_year, track_number, disc_number,
+                             bitrate, status, downloaded_at, created_at, updated_at,
+                             source_kind, source_id
+                         ) VALUES(
+                             NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             'available', ?13, ?13, ?13, 'local', ?5
+                         )",
+                        params![
+                            file.title,
+                            file.artists,
+                            file.album,
+                            file.duration_ms as i64,
+                            path,
+                            file.file_size as i64,
+                            file.format,
+                            file.album_artist,
+                            file.release_year,
+                            file.track_number.map(|value| value as i64),
+                            file.disc_number.map(|value| value as i64),
+                            file.bitrate as i64,
+                            now
+                        ],
+                    )?;
+                    transaction.last_insert_rowid()
+                }
             };
-            if migrated_track.is_none() {
-                transaction.execute(
-                    "INSERT INTO tracks(
-                         ncm_id, title, artists, album, duration_ms, file_path, file_size,
-                         format, album_artist, release_year, track_number, disc_number,
-                         bitrate, status, downloaded_at, updated_at, source_kind, source_id
-                     ) VALUES(
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                         'available', ?14, ?14, 'local', ?6
-                     )",
-                    params![
-                        track_id,
-                        file.title,
-                        file.artists,
-                        file.album,
-                        file.duration_ms as i64,
-                        path,
-                        file.file_size as i64,
-                        file.format,
-                        file.album_artist,
-                        file.release_year,
-                        file.track_number.map(|value| value as i64),
-                        file.disc_number.map(|value| value as i64),
-                        file.bitrate as i64,
-                        now
-                    ],
-                )?;
-            } else {
-                transaction.execute(
-                    "UPDATE tracks SET status='available', file_size=?1, format=?2,
-                         updated_at=?3 WHERE ncm_id=?4",
-                    params![file.file_size as i64, file.format, now, track_id],
-                )?;
-            }
             transaction.execute(
                 "INSERT INTO media_locations(
                      track_id, filepath, format, file_size, modified_ns, is_present,
@@ -1189,7 +1254,7 @@ impl LibraryDb {
                 )?;
                 transaction.execute(
                     "UPDATE tracks SET status='missing', updated_at=?1
-                     WHERE ncm_id=?2 AND NOT EXISTS(
+                     WHERE id=?2 AND NOT EXISTS(
                          SELECT 1 FROM media_locations WHERE track_id=?2 AND is_present=1
                      )",
                     params![now, track_id],
@@ -1216,8 +1281,9 @@ impl LibraryDb {
     pub fn reconcile_known_files(&self) -> Result<usize> {
         let connection = self.lock()?;
         let paths = {
-            let mut statement =
-                connection.prepare_cached("SELECT ncm_id, file_path FROM tracks")?;
+            let mut statement = connection.prepare_cached(
+                "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND file_path<>''",
+            )?;
             let rows = statement.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -1225,7 +1291,7 @@ impl LibraryDb {
         };
         let transaction = connection.unchecked_transaction()?;
         let mut changed = 0;
-        for (ncm_id, path) in paths {
+        for (track_id, path) in paths {
             let status = if Path::new(&path).is_file() {
                 "available"
             } else {
@@ -1233,12 +1299,19 @@ impl LibraryDb {
             };
             changed += transaction.execute(
                 "UPDATE tracks SET status=?1, updated_at=?2
-                 WHERE ncm_id=?3 AND status<>?1",
-                params![status, unix_timestamp(), ncm_id],
+                 WHERE id=?3 AND status<>?1",
+                params![status, unix_timestamp(), track_id],
             )?;
         }
         transaction.commit()?;
         Ok(changed)
+    }
+
+    fn query_tracks(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<LibraryTrack>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map(params, map_library_track)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn run_incremental_maintenance(&self) -> Result<()> {
@@ -1265,42 +1338,56 @@ impl LibraryDb {
 
 fn map_library_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryTrack> {
     Ok(LibraryTrack {
-        ncm_id: row.get::<_, i64>(0)? as u64,
-        title: row.get(1)?,
-        artists: row.get(2)?,
-        album: row.get(3)?,
-        file_path: PathBuf::from(row.get::<_, String>(4)?),
-        format: row.get(5)?,
-        file_size: row.get::<_, i64>(6)? as u64,
-        downloaded_at: row.get(7)?,
-        duration_ms: row.get::<_, i64>(8)? as u64,
-        favorite: row.get(9)?,
-        play_count: row.get::<_, i64>(10)? as u64,
-        last_played_at: row.get(11)?,
+        id: row.get::<_, i64>(0)? as u64,
+        ncm_id: row.get::<_, Option<i64>>(1)?.map(|id| id as u64),
+        source_kind: row.get(2)?,
+        title: row.get(3)?,
+        artists: row.get(4)?,
+        album: row.get(5)?,
+        file_path: row
+            .get::<_, Option<String>>(6)?
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        format: row.get(7)?,
+        file_size: row.get::<_, i64>(8)? as u64,
+        downloaded_at: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+        duration_ms: row.get::<_, i64>(10)? as u64,
+        favorite: row.get(11)?,
+        play_count: row.get::<_, i64>(12)? as u64,
+        last_played_at: row.get(13)?,
+        cover_url: row.get(14)?,
     })
 }
 
 fn map_organizable_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrganizableTrack> {
     Ok(OrganizableTrack {
         id: row.get::<_, i64>(0)? as u64,
-        title: row.get(1)?,
-        artists: row.get(2)?,
-        album: row.get(3)?,
-        album_artist: row.get(4)?,
-        track_number: row.get(5)?,
-        disc_number: row.get(6)?,
-        total_tracks: row.get(7)?,
-        format: row.get(8)?,
-        path: PathBuf::from(row.get::<_, String>(9)?),
+        ncm_id: row.get::<_, Option<i64>>(1)?.map(|id| id as u64),
+        title: row.get(2)?,
+        artists: row.get(3)?,
+        album: row.get(4)?,
+        album_artist: row.get(5)?,
+        track_number: row.get(6)?,
+        disc_number: row.get(7)?,
+        total_tracks: row.get(8)?,
+        format: row.get(9)?,
+        path: PathBuf::from(row.get::<_, Option<String>>(10)?.unwrap_or_default()),
     })
 }
 
-fn table_has_column(
-    transaction: &rusqlite::Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> rusqlite::Result<bool> {
-    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let found: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = statement.query_map([], |row| row.get::<_, String>(1))?;
     for name in names {
         if name? == column {
@@ -1310,37 +1397,450 @@ fn table_has_column(
     Ok(false)
 }
 
-fn allocate_local_track_id(
-    transaction: &rusqlite::Transaction<'_>,
-    path: &str,
-    allocated: &mut HashMap<i64, String>,
-) -> Result<i64> {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+fn create_v5_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tracks (
+             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+             ncm_id          INTEGER UNIQUE,
+             source_kind     TEXT NOT NULL DEFAULT 'ncm',
+             source_id       TEXT NOT NULL DEFAULT '',
+             title           TEXT NOT NULL,
+             artists         TEXT NOT NULL,
+             album_id        INTEGER,
+             album           TEXT NOT NULL DEFAULT '',
+             duration_ms     INTEGER NOT NULL DEFAULT 0,
+             album_artist    TEXT NOT NULL DEFAULT '',
+             release_year    INTEGER,
+             track_number    INTEGER,
+             disc_number     INTEGER,
+             total_tracks    INTEGER,
+             cover_url       TEXT NOT NULL DEFAULT '',
+             file_path       TEXT UNIQUE,
+             file_size       INTEGER NOT NULL DEFAULT 0,
+             format          TEXT NOT NULL DEFAULT '',
+             bitrate         INTEGER NOT NULL DEFAULT 0,
+             audio_md5       TEXT NOT NULL DEFAULT '',
+             status          TEXT NOT NULL DEFAULT 'remote',
+             downloaded_at   INTEGER,
+             created_at      INTEGER NOT NULL,
+             updated_at      INTEGER NOT NULL,
+             favorite        INTEGER NOT NULL DEFAULT 0,
+             play_count      INTEGER NOT NULL DEFAULT 0,
+             last_played_at  INTEGER
+         );
+
+         CREATE TABLE IF NOT EXISTS collections (
+             kind             TEXT NOT NULL,
+             ncm_id           INTEGER NOT NULL,
+             name             TEXT NOT NULL,
+             updated_at       INTEGER NOT NULL,
+             PRIMARY KEY(kind, ncm_id)
+         ) WITHOUT ROWID;
+
+         CREATE TABLE IF NOT EXISTS collection_tracks (
+             collection_kind  TEXT NOT NULL,
+             collection_id    INTEGER NOT NULL,
+             track_id         INTEGER NOT NULL,
+             position         INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(collection_kind, collection_id, track_id),
+             FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+         ) WITHOUT ROWID;
+
+         CREATE TABLE IF NOT EXISTS media_locations (
+             track_id      INTEGER NOT NULL,
+             filepath      TEXT NOT NULL UNIQUE,
+             format        TEXT NOT NULL DEFAULT '',
+             file_size     INTEGER NOT NULL DEFAULT 0,
+             modified_ns   INTEGER NOT NULL DEFAULT 0,
+             is_present    INTEGER NOT NULL DEFAULT 1,
+             first_seen_at INTEGER NOT NULL,
+             last_seen_at  INTEGER NOT NULL,
+             PRIMARY KEY(track_id, filepath),
+             FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS playback_queue (
+             position    INTEGER PRIMARY KEY,
+             track_id    INTEGER NOT NULL,
+             enqueued_at INTEGER NOT NULL,
+             FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS playback_history (
+             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+             track_id  INTEGER NOT NULL,
+             played_at INTEGER NOT NULL,
+             origin    TEXT NOT NULL DEFAULT 'local',
+             FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS playback_state (
+             singleton      INTEGER PRIMARY KEY CHECK(singleton=1),
+             current_index  INTEGER,
+             updated_at     INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO playback_state(singleton) VALUES(1);
+
+         CREATE TABLE IF NOT EXISTS lifecycle_events (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             entity_kind TEXT NOT NULL,
+             entity_id   TEXT NOT NULL DEFAULT '',
+             action      TEXT NOT NULL,
+             detail      TEXT NOT NULL DEFAULT '',
+             created_at  INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS maintenance_state (
+             singleton       INTEGER PRIMARY KEY CHECK(singleton=1),
+             downloads_since INTEGER NOT NULL DEFAULT 0,
+             last_run_at     INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO maintenance_state(singleton) VALUES(1);",
+    )?;
+    create_v5_indexes(transaction)
+}
+
+fn create_v5_indexes(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_source
+             ON tracks(source_kind, source_id) WHERE source_id<>'';
+         CREATE INDEX IF NOT EXISTS idx_tracks_downloaded
+             ON tracks(status, downloaded_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_tracks_available_title
+             ON tracks(title COLLATE NOCASE, id) WHERE status='available';
+         CREATE INDEX IF NOT EXISTS idx_tracks_album
+             ON tracks(album_id, id);
+         CREATE INDEX IF NOT EXISTS idx_tracks_artists
+             ON tracks(artists COLLATE NOCASE, title COLLATE NOCASE);
+         CREATE INDEX IF NOT EXISTS idx_collection_tracks_track
+             ON collection_tracks(track_id);
+         CREATE INDEX IF NOT EXISTS idx_media_locations_present
+             ON media_locations(is_present, track_id);
+         CREATE INDEX IF NOT EXISTS idx_playback_history_recent
+             ON playback_history(played_at DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS idx_lifecycle_events_recent
+             ON lifecycle_events(created_at DESC, id DESC);
+
+         CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+             title, artists, album,
+             content='tracks', content_rowid='id',
+             tokenize='unicode61 remove_diacritics 2'
+         );
+
+         DROP TRIGGER IF EXISTS tracks_ai;
+         DROP TRIGGER IF EXISTS tracks_ad;
+         DROP TRIGGER IF EXISTS tracks_au;
+         CREATE TRIGGER tracks_ai AFTER INSERT ON tracks BEGIN
+             INSERT INTO tracks_fts(rowid, title, artists, album)
+             VALUES (new.id, new.title, new.artists, new.album);
+         END;
+         CREATE TRIGGER tracks_ad AFTER DELETE ON tracks BEGIN
+             INSERT INTO tracks_fts(tracks_fts, rowid, title, artists, album)
+             VALUES ('delete', old.id, old.title, old.artists, old.album);
+         END;
+         CREATE TRIGGER tracks_au AFTER UPDATE OF title, artists, album ON tracks BEGIN
+             INSERT INTO tracks_fts(tracks_fts, rowid, title, artists, album)
+             VALUES ('delete', old.id, old.title, old.artists, old.album);
+             INSERT INTO tracks_fts(rowid, title, artists, album)
+             VALUES (new.id, new.title, new.artists, new.album);
+         END;",
+    )
+}
+
+fn ensure_legacy_columns(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tracks (
+             ncm_id          INTEGER PRIMARY KEY,
+             title           TEXT NOT NULL,
+             artists         TEXT NOT NULL,
+             album_id        INTEGER,
+             album           TEXT NOT NULL DEFAULT '',
+             duration_ms     INTEGER NOT NULL DEFAULT 0,
+             album_artist    TEXT NOT NULL DEFAULT '',
+             release_year    INTEGER,
+             track_number    INTEGER,
+             disc_number     INTEGER,
+             total_tracks    INTEGER,
+             cover_url       TEXT NOT NULL DEFAULT '',
+             file_path       TEXT NOT NULL UNIQUE,
+             file_size       INTEGER NOT NULL DEFAULT 0,
+             format          TEXT NOT NULL DEFAULT '',
+             bitrate         INTEGER NOT NULL DEFAULT 0,
+             audio_md5       TEXT NOT NULL DEFAULT '',
+             status          TEXT NOT NULL DEFAULT 'available',
+             downloaded_at   INTEGER NOT NULL,
+             updated_at      INTEGER NOT NULL,
+             source_kind     TEXT NOT NULL DEFAULT 'ncm',
+             source_id       TEXT NOT NULL DEFAULT '',
+             favorite        INTEGER NOT NULL DEFAULT 0,
+             play_count      INTEGER NOT NULL DEFAULT 0,
+             last_played_at  INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS collections (
+             kind             TEXT NOT NULL,
+             ncm_id           INTEGER NOT NULL,
+             name             TEXT NOT NULL,
+             updated_at       INTEGER NOT NULL,
+             PRIMARY KEY(kind, ncm_id)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS collection_tracks (
+             collection_kind  TEXT NOT NULL,
+             collection_id    INTEGER NOT NULL,
+             track_id         INTEGER NOT NULL,
+             position         INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(collection_kind, collection_id, track_id)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS media_locations (
+             track_id      INTEGER NOT NULL,
+             filepath      TEXT NOT NULL UNIQUE,
+             format        TEXT NOT NULL DEFAULT '',
+             file_size     INTEGER NOT NULL DEFAULT 0,
+             modified_ns   INTEGER NOT NULL DEFAULT 0,
+             is_present    INTEGER NOT NULL DEFAULT 1,
+             first_seen_at INTEGER NOT NULL,
+             last_seen_at  INTEGER NOT NULL,
+             PRIMARY KEY(track_id, filepath)
+         );
+         CREATE TABLE IF NOT EXISTS playback_queue (
+             position    INTEGER PRIMARY KEY,
+             track_id    INTEGER NOT NULL UNIQUE,
+             enqueued_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS playback_history (
+             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+             track_id  INTEGER NOT NULL,
+             played_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS lifecycle_events (
+             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+             entity_kind TEXT NOT NULL,
+             entity_id   TEXT NOT NULL DEFAULT '',
+             action      TEXT NOT NULL,
+             detail      TEXT NOT NULL DEFAULT '',
+             created_at  INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS maintenance_state (
+             singleton       INTEGER PRIMARY KEY CHECK(singleton=1),
+             downloads_since INTEGER NOT NULL DEFAULT 0,
+             last_run_at     INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO maintenance_state(singleton) VALUES(1);",
+    )?;
+    if !table_has_column(transaction, "tracks", "source_kind")? {
+        transaction.execute_batch(
+            "ALTER TABLE tracks ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'ncm';
+             ALTER TABLE tracks ADD COLUMN source_id TEXT NOT NULL DEFAULT '';
+             ALTER TABLE tracks ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tracks ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tracks ADD COLUMN last_played_at INTEGER;",
+        )?;
     }
-    let mut candidate = LOCAL_TRACK_ID_BASE + hash % LOCAL_TRACK_ID_RANGE;
-    loop {
-        let id = candidate as i64;
-        let existing_source = transaction
-            .query_row(
-                "SELECT source_id FROM tracks WHERE ncm_id=?1",
-                [id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if existing_source
-            .as_deref()
-            .is_none_or(|source| source == path)
-            && allocated.get(&id).is_none_or(|source| source == path)
-        {
-            allocated.insert(id, path.to_owned());
-            return Ok(id);
+    for (column, definition) in [
+        ("album_id", "INTEGER"),
+        ("album_artist", "TEXT NOT NULL DEFAULT ''"),
+        ("release_year", "INTEGER"),
+        ("track_number", "INTEGER"),
+        ("disc_number", "INTEGER"),
+        ("total_tracks", "INTEGER"),
+        ("cover_url", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !table_has_column(transaction, "tracks", column)? {
+            transaction.execute(
+                &format!("ALTER TABLE tracks ADD COLUMN {column} {definition}"),
+                [],
+            )?;
         }
-        candidate =
-            LOCAL_TRACK_ID_BASE + (candidate - LOCAL_TRACK_ID_BASE + 1) % LOCAL_TRACK_ID_RANGE;
     }
+    Ok(())
+}
+
+fn migrate_legacy_to_v5(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "DROP TRIGGER IF EXISTS tracks_ai;
+         DROP TRIGGER IF EXISTS tracks_ad;
+         DROP TRIGGER IF EXISTS tracks_au;
+         DROP TABLE IF EXISTS tracks_fts;
+         DROP TABLE IF EXISTS tracks_new;
+         DROP TABLE IF EXISTS track_id_map;
+
+         CREATE TABLE tracks_new (
+             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+             old_pk          INTEGER NOT NULL UNIQUE,
+             ncm_id          INTEGER UNIQUE,
+             source_kind     TEXT NOT NULL DEFAULT 'ncm',
+             source_id       TEXT NOT NULL DEFAULT '',
+             title           TEXT NOT NULL,
+             artists         TEXT NOT NULL,
+             album_id        INTEGER,
+             album           TEXT NOT NULL DEFAULT '',
+             duration_ms     INTEGER NOT NULL DEFAULT 0,
+             album_artist    TEXT NOT NULL DEFAULT '',
+             release_year    INTEGER,
+             track_number    INTEGER,
+             disc_number     INTEGER,
+             total_tracks    INTEGER,
+             cover_url       TEXT NOT NULL DEFAULT '',
+             file_path       TEXT UNIQUE,
+             file_size       INTEGER NOT NULL DEFAULT 0,
+             format          TEXT NOT NULL DEFAULT '',
+             bitrate         INTEGER NOT NULL DEFAULT 0,
+             audio_md5       TEXT NOT NULL DEFAULT '',
+             status          TEXT NOT NULL DEFAULT 'remote',
+             downloaded_at   INTEGER,
+             created_at      INTEGER NOT NULL,
+             updated_at      INTEGER NOT NULL,
+             favorite        INTEGER NOT NULL DEFAULT 0,
+             play_count      INTEGER NOT NULL DEFAULT 0,
+             last_played_at  INTEGER
+         );
+
+         INSERT INTO tracks_new (
+             old_pk, ncm_id, source_kind, source_id, title, artists, album_id, album,
+             duration_ms, album_artist, release_year, track_number, disc_number,
+             total_tracks, cover_url, file_path, file_size, format, bitrate, audio_md5,
+             status, downloaded_at, created_at, updated_at, favorite, play_count,
+             last_played_at
+         )
+         SELECT
+             ncm_id,
+             CASE WHEN COALESCE(source_kind, 'ncm')='ncm' THEN ncm_id END,
+             COALESCE(source_kind, 'ncm'),
+             CASE
+                 WHEN COALESCE(source_kind, 'ncm')='local'
+                     THEN COALESCE(NULLIF(source_id, ''), file_path)
+                 ELSE CAST(ncm_id AS TEXT)
+             END,
+             title, artists, album_id, album, duration_ms, album_artist, release_year,
+             track_number, disc_number, total_tracks, cover_url, NULLIF(file_path, ''),
+             file_size, format, bitrate, audio_md5,
+             CASE WHEN status IN ('available', 'missing', 'remote') THEN status ELSE 'available' END,
+             downloaded_at, downloaded_at, updated_at, favorite, play_count, last_played_at
+         FROM tracks;
+
+         CREATE TABLE track_id_map (
+             old_id INTEGER PRIMARY KEY,
+             new_id INTEGER NOT NULL
+         );
+         INSERT INTO track_id_map(old_id, new_id)
+         SELECT old_pk, id FROM tracks_new;",
+    )?;
+
+    transaction.execute_batch(
+        "CREATE TABLE collection_tracks_new (
+             collection_kind  TEXT NOT NULL,
+             collection_id    INTEGER NOT NULL,
+             track_id         INTEGER NOT NULL,
+             position         INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY(collection_kind, collection_id, track_id)
+         ) WITHOUT ROWID;
+         INSERT OR IGNORE INTO collection_tracks_new
+         SELECT c.collection_kind, c.collection_id, m.new_id, c.position
+         FROM collection_tracks c
+         JOIN track_id_map m ON m.old_id=c.track_id;
+         DROP TABLE collection_tracks;
+         ALTER TABLE collection_tracks_new RENAME TO collection_tracks;
+
+         CREATE TABLE media_locations_new (
+             track_id      INTEGER NOT NULL,
+             filepath      TEXT NOT NULL UNIQUE,
+             format        TEXT NOT NULL DEFAULT '',
+             file_size     INTEGER NOT NULL DEFAULT 0,
+             modified_ns   INTEGER NOT NULL DEFAULT 0,
+             is_present    INTEGER NOT NULL DEFAULT 1,
+             first_seen_at INTEGER NOT NULL,
+             last_seen_at  INTEGER NOT NULL,
+             PRIMARY KEY(track_id, filepath)
+         );
+         INSERT OR IGNORE INTO media_locations_new
+         SELECT m.new_id, l.filepath, l.format, l.file_size, l.modified_ns,
+                l.is_present, l.first_seen_at, l.last_seen_at
+         FROM media_locations l
+         JOIN track_id_map m ON m.old_id=l.track_id;
+         DROP TABLE media_locations;
+         ALTER TABLE media_locations_new RENAME TO media_locations;
+
+         CREATE TABLE playback_queue_new (
+             position    INTEGER PRIMARY KEY,
+             track_id    INTEGER NOT NULL,
+             enqueued_at INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO playback_queue_new
+         SELECT q.position, m.new_id, q.enqueued_at
+         FROM playback_queue q
+         JOIN track_id_map m ON m.old_id=q.track_id;
+         DROP TABLE playback_queue;
+         ALTER TABLE playback_queue_new RENAME TO playback_queue;
+
+         CREATE TABLE playback_history_new (
+             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+             track_id  INTEGER NOT NULL,
+             played_at INTEGER NOT NULL,
+             origin    TEXT NOT NULL DEFAULT 'local'
+         );
+         INSERT INTO playback_history_new(track_id, played_at, origin)
+         SELECT m.new_id, h.played_at, 'local'
+         FROM playback_history h
+         JOIN track_id_map m ON m.old_id=h.track_id;
+         DROP TABLE playback_history;
+         ALTER TABLE playback_history_new RENAME TO playback_history;
+
+         CREATE TABLE IF NOT EXISTS playback_state (
+             singleton      INTEGER PRIMARY KEY CHECK(singleton=1),
+             current_index  INTEGER,
+             updated_at     INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO playback_state(singleton) VALUES(1);
+
+         DROP TABLE tracks;
+         CREATE TABLE tracks (
+             id              INTEGER PRIMARY KEY AUTOINCREMENT,
+             ncm_id          INTEGER UNIQUE,
+             source_kind     TEXT NOT NULL DEFAULT 'ncm',
+             source_id       TEXT NOT NULL DEFAULT '',
+             title           TEXT NOT NULL,
+             artists         TEXT NOT NULL,
+             album_id        INTEGER,
+             album           TEXT NOT NULL DEFAULT '',
+             duration_ms     INTEGER NOT NULL DEFAULT 0,
+             album_artist    TEXT NOT NULL DEFAULT '',
+             release_year    INTEGER,
+             track_number    INTEGER,
+             disc_number     INTEGER,
+             total_tracks    INTEGER,
+             cover_url       TEXT NOT NULL DEFAULT '',
+             file_path       TEXT UNIQUE,
+             file_size       INTEGER NOT NULL DEFAULT 0,
+             format          TEXT NOT NULL DEFAULT '',
+             bitrate         INTEGER NOT NULL DEFAULT 0,
+             audio_md5       TEXT NOT NULL DEFAULT '',
+             status          TEXT NOT NULL DEFAULT 'remote',
+             downloaded_at   INTEGER,
+             created_at      INTEGER NOT NULL,
+             updated_at      INTEGER NOT NULL,
+             favorite        INTEGER NOT NULL DEFAULT 0,
+             play_count      INTEGER NOT NULL DEFAULT 0,
+             last_played_at  INTEGER
+         );
+         INSERT INTO tracks (
+             id, ncm_id, source_kind, source_id, title, artists, album_id, album,
+             duration_ms, album_artist, release_year, track_number, disc_number,
+             total_tracks, cover_url, file_path, file_size, format, bitrate, audio_md5,
+             status, downloaded_at, created_at, updated_at, favorite, play_count,
+             last_played_at
+         )
+         SELECT
+             id, ncm_id, source_kind, source_id, title, artists, album_id, album,
+             duration_ms, album_artist, release_year, track_number, disc_number,
+             total_tracks, cover_url, file_path, file_size, format, bitrate, audio_md5,
+             status, downloaded_at, created_at, updated_at, favorite, play_count,
+             last_played_at
+         FROM tracks_new;
+         DROP TABLE tracks_new;
+         DROP TABLE track_id_map;",
+    )?;
+    create_v5_indexes(transaction)?;
+    transaction.execute("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')", [])?;
+    Ok(())
 }
 
 fn record_event(
@@ -1409,7 +1909,9 @@ mod tests {
         track.collection_position = 1;
         database.record_download(&track).unwrap();
 
-        assert_eq!(database.available_path(42).unwrap(), Some(audio_path));
+        let id = database.id_by_ncm(42).unwrap().unwrap();
+        assert_ne!(id, 42);
+        assert_eq!(database.available_path(id).unwrap(), Some(audio_path));
         assert_eq!(database.search("透明", 10).unwrap().len(), 1);
         assert_eq!(database.stats().unwrap().tracks, 1);
     }
@@ -1440,12 +1942,13 @@ mod tests {
         database
             .record_download(&downloaded_track(52, old_path.clone()))
             .unwrap();
+        let id = database.id_by_ncm(52).unwrap().unwrap();
 
         fs::create_dir_all(new_path.parent().unwrap()).unwrap();
         fs::rename(&old_path, &new_path).unwrap();
-        assert!(database.record_move(52, &old_path, &new_path, 10).unwrap());
+        assert!(database.record_move(id, &old_path, &new_path, 10).unwrap());
 
-        assert_eq!(database.available_path(52).unwrap(), Some(new_path));
+        assert_eq!(database.available_path(id).unwrap(), Some(new_path));
     }
 
     #[test]
@@ -1466,7 +1969,7 @@ mod tests {
         let position: i64 = connection
             .query_row(
                 "SELECT position FROM collection_tracks
-                 WHERE collection_kind='album' AND collection_id=12 AND track_id=61",
+                 WHERE collection_kind='album' AND collection_id=12",
                 [],
                 |row| row.get(0),
             )
@@ -1498,6 +2001,105 @@ mod tests {
     }
 
     #[test]
+    fn migrates_legacy_ncm_primary_keys_to_surrogate_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join(INTERNAL_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        let path = directory.path().join("legacy.mp3");
+        fs::write(&path, b"audio").unwrap();
+        let legacy = Connection::open(state_dir.join(DATABASE_NAME)).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE schema_meta (version INTEGER NOT NULL);
+                 INSERT INTO schema_meta(version) VALUES(4);
+                 CREATE TABLE tracks (
+                     ncm_id INTEGER PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     artists TEXT NOT NULL,
+                     album TEXT NOT NULL DEFAULT '',
+                     duration_ms INTEGER NOT NULL DEFAULT 0,
+                     file_path TEXT NOT NULL UNIQUE,
+                     file_size INTEGER NOT NULL DEFAULT 0,
+                     format TEXT NOT NULL DEFAULT '',
+                     bitrate INTEGER NOT NULL DEFAULT 0,
+                     audio_md5 TEXT NOT NULL DEFAULT '',
+                     status TEXT NOT NULL DEFAULT 'available',
+                     downloaded_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     source_kind TEXT NOT NULL DEFAULT 'ncm',
+                     source_id TEXT NOT NULL DEFAULT '',
+                     favorite INTEGER NOT NULL DEFAULT 0,
+                     play_count INTEGER NOT NULL DEFAULT 0,
+                     last_played_at INTEGER
+                 );
+                 CREATE TABLE collections (
+                     kind TEXT NOT NULL,
+                     ncm_id INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(kind, ncm_id)
+                 );
+                 CREATE TABLE collection_tracks (
+                     collection_kind TEXT NOT NULL,
+                     collection_id INTEGER NOT NULL,
+                     track_id INTEGER NOT NULL,
+                     position INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(collection_kind, collection_id, track_id)
+                 );
+                 CREATE TABLE media_locations (
+                     track_id INTEGER NOT NULL,
+                     filepath TEXT NOT NULL UNIQUE,
+                     format TEXT NOT NULL DEFAULT '',
+                     file_size INTEGER NOT NULL DEFAULT 0,
+                     modified_ns INTEGER NOT NULL DEFAULT 0,
+                     is_present INTEGER NOT NULL DEFAULT 1,
+                     first_seen_at INTEGER NOT NULL,
+                     last_seen_at INTEGER NOT NULL,
+                     PRIMARY KEY(track_id, filepath)
+                 );
+                 CREATE TABLE playback_queue (
+                     position INTEGER PRIMARY KEY,
+                     track_id INTEGER NOT NULL UNIQUE,
+                     enqueued_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE playback_history (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     track_id INTEGER NOT NULL,
+                     played_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE lifecycle_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     entity_kind TEXT NOT NULL,
+                     entity_id TEXT NOT NULL DEFAULT '',
+                     action TEXT NOT NULL,
+                     detail TEXT NOT NULL DEFAULT '',
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE maintenance_state (
+                     singleton INTEGER PRIMARY KEY,
+                     downloads_since INTEGER NOT NULL DEFAULT 0,
+                     last_run_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO maintenance_state(singleton) VALUES(1);",
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO tracks(
+                     ncm_id, title, artists, file_path, downloaded_at, updated_at, source_kind
+                 ) VALUES (99, '旧主键', 'A', ?1, 1, 1, 'ncm')",
+                [path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let database = LibraryDb::open(directory.path()).unwrap();
+        let id = database.id_by_ncm(99).unwrap().unwrap();
+        assert_ne!(id, 99);
+        assert_eq!(database.search("旧主键", 10).unwrap()[0].ncm_id, Some(99));
+    }
+
+    #[test]
     fn favorite_queue_and_history_are_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let audio_path = directory.path().join("queue.mp3");
@@ -1506,16 +2108,48 @@ mod tests {
         database
             .record_download(&downloaded_track(71, audio_path))
             .unwrap();
+        let id = database.id_by_ncm(71).unwrap().unwrap();
 
-        assert_eq!(database.toggle_favorite(71).unwrap(), Some(true));
-        assert!(database.enqueue(71).unwrap());
-        assert!(!database.enqueue(71).unwrap());
-        assert!(!database.enqueue(999).unwrap());
+        assert_eq!(database.toggle_favorite(id).unwrap(), Some(true));
+        assert_eq!(database.enqueue_next(id).unwrap(), EnqueueOutcome::Inserted);
+        assert_eq!(
+            database.enqueue_next(id).unwrap(),
+            EnqueueOutcome::AlreadyNext
+        );
+        assert_eq!(database.enqueue_next(999).unwrap(), EnqueueOutcome::Missing);
         assert_eq!(database.queue().unwrap().len(), 1);
-        assert!(database.record_play(71).unwrap());
-        assert!(database.queue().unwrap().is_empty());
+        assert!(database.record_play(id, PlayOrigin::Local).unwrap());
+        assert_eq!(database.queue().unwrap().len(), 1);
+        assert_eq!(database.history(10).unwrap().len(), 1);
         let stats = database.stats().unwrap();
         assert_eq!(stats.favorites, 1);
         assert_eq!(stats.plays, 1);
+    }
+
+    #[test]
+    fn streaming_tracks_share_the_library_and_recent_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = LibraryDb::open(directory.path()).unwrap();
+        let id = database
+            .ensure_catalog(&CatalogTrack {
+                ncm_id: 347230,
+                title: "海阔天空".into(),
+                artists: "Beyond".into(),
+                album: "乐与怒".into(),
+                duration_ms: 1000,
+                cover_url: String::new(),
+            })
+            .unwrap();
+        assert_ne!(id, 347230);
+        assert!(database.available_path(id).unwrap().is_none());
+        assert!(database.record_play(id, PlayOrigin::Stream).unwrap());
+        let history = database.history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.ncm_id, Some(347230));
+        assert_eq!(history[0].0.title, "海阔天空");
+        database.replace_queue(&[id, id], Some(0)).unwrap();
+        assert_eq!(database.queue_index().unwrap(), Some(0));
+        assert_eq!(database.queue().unwrap().len(), 2);
+        assert_eq!(database.queue().unwrap()[0].id, id);
     }
 }

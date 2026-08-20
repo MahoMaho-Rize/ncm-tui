@@ -724,7 +724,7 @@ pub(super) fn draw_tracks(
 }
 
 fn track_lead(app: &App, track: &TrackRow) -> &'static str {
-    if app.current == Some(track.id) {
+    if app.is_playing(track) {
         "▶"
     } else if track.favorite {
         "♥"
@@ -1695,7 +1695,12 @@ pub(super) fn draw_details_overlay(frame: &mut Frame, app: &App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled("NCM ID  ", Style::default().fg(app.theme.muted)),
-                Span::raw(track.id.to_string()),
+                Span::raw(
+                    track
+                        .ncm_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("年份    ", Style::default().fg(app.theme.muted)),

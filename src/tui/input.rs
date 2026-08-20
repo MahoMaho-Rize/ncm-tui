@@ -226,15 +226,7 @@ pub(super) fn dispatch_action(app: &mut App, action: UiAction) -> bool {
         }
         UiAction::ClearQueue => {
             if app.route == Route::Queue {
-                match app.services.library.clear_queue() {
-                    Ok(0) => app.status = "队列已空".into(),
-                    Ok(count) => {
-                        app.status = format!("已清空队列 {count} 首");
-                        app.push_toast(ToastKind::Success, app.status.clone());
-                        app.load_local();
-                    }
-                    Err(error) => app.status = error.to_string(),
-                }
+                app.clear_play_queue();
             }
         }
         UiAction::Search => {
@@ -580,7 +572,7 @@ pub(super) fn query_local(
             (Route::Local, LocalLayer::Artist(name)) => library.list_by_artist(name, 10_000),
             (Route::Local, LocalLayer::Tracks(view)) => library.list_view(*view, sort, 10_000),
             (Route::Local, LocalLayer::Menu) => library.list_view(TrackView::All, sort, 10_000),
-            (Route::Recent, _) => library.recent(1_000),
+            (Route::Recent, _) => library.history(1_000),
             (Route::Queue, _) => library.queue(),
             _ => return Ok((Vec::new(), None)),
         }

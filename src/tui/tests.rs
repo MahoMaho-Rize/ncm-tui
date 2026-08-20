@@ -43,7 +43,9 @@ use crate::{
     download::{
         AudioQuality, DownloadReport, DownloadRequest, DownloadSource, Downloader, TrackSelection,
     },
-    library::{Library, LibraryStats, ScanReport, Track, TrackSort, TrackView},
+    library::{
+        CatalogTrack, Library, LibraryStats, PlayOrigin, ScanReport, Track, TrackSort, TrackView,
+    },
     lyrics::{LyricLine, Lyrics},
     organizer::MoveOutcome,
     pagination::{self, PAGE_SIZE, PaginationInfo},
@@ -62,14 +64,13 @@ use crate::ncm_core::{NcmClient, SessionConfig};
 fn test_app() -> (TempDir, App) {
     let directory = tempfile::tempdir().unwrap();
     let client = NcmClient::new(SessionConfig::default(), Duration::from_secs(1)).unwrap();
+    let library = Library::open(directory.path()).unwrap();
+    let downloader = Downloader::new(client.clone(), &library, 1).unwrap();
     let services = Services {
         authentication: Authentication::new(client.clone(), directory.path().join("session.json")),
-        discovery: Discovery::with_lyrics_dir(
-            client.clone(),
-            directory.path().join("lyrics-cache"),
-        ),
-        library: Library::open(directory.path()).unwrap(),
-        downloader: Downloader::new(client, directory.path(), 1).unwrap(),
+        discovery: Discovery::with_lyrics_dir(client, directory.path().join("lyrics-cache")),
+        library,
+        downloader,
         library_roots: vec![directory.path().to_path_buf()],
         ui_state_path: directory.path().join("ui.toml"),
         playback_cache: PlaybackCache::open_blocking(
@@ -593,7 +594,7 @@ async fn load_covers_always_starts_a_fetch_when_no_embedded_art() {
         app.cover_task.is_some(),
         "missing library cover_url must still ask song/detail"
     );
-    assert_eq!(app.cover_track, Some(99));
+    assert_eq!(app.cover_track, Some(0));
 }
 
 #[tokio::test]
@@ -1271,7 +1272,8 @@ async fn clearing_cache_requires_a_second_confirmation() {
 
 fn test_track(id: u64) -> TrackRow {
     TrackRow {
-        id,
+        id: 0,
+        ncm_id: Some(id),
         title: format!("Song {id}"),
         artists: "Artist".into(),
         album: "Album".into(),
@@ -1321,4 +1323,94 @@ fn miku_theme_uses_transparent_base_and_turquoise_accent() {
     let theme = Theme::miku();
     assert_eq!(theme.background, Color::Reset);
     assert_eq!(theme.accent, Color::Rgb(57, 197, 187));
+}
+
+#[tokio::test]
+async fn activating_a_list_replaces_the_persisted_play_queue() {
+    let (_directory, mut app) = test_app();
+    app.route = Route::Daily;
+    app.focus = Focus::Content;
+    app.content = Content::Tracks(vec![test_track(11), test_track(12), test_track(13)]);
+    app.selected = 1;
+    app.activate();
+    let queue = app.services.library.queue().unwrap();
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.iter().map(|track| track.ncm_id).collect::<Vec<_>>(),
+        vec![Some(11), Some(12), Some(13)]
+    );
+    assert_eq!(app.queue_index, Some(1));
+    assert_eq!(app.services.library.queue_index().unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn enqueue_inserts_after_the_current_item_without_dropping_on_play() {
+    let (_directory, mut app) = test_app();
+    app.route = Route::Daily;
+    app.focus = Focus::Content;
+    app.content = Content::Tracks(vec![test_track(21), test_track(22)]);
+    app.selected = 0;
+    app.activate();
+    app.content = Content::Tracks(vec![test_track(23)]);
+    app.selected = 0;
+    app.enqueue();
+    let queue = app.services.library.queue().unwrap();
+    assert_eq!(
+        queue.iter().map(|track| track.ncm_id).collect::<Vec<_>>(),
+        vec![Some(21), Some(23), Some(22)]
+    );
+    let current = queue[app.queue_index.unwrap()].id;
+    app.services
+        .library
+        .record_play(current, PlayOrigin::Stream)
+        .unwrap();
+    assert_eq!(app.services.library.queue().unwrap().len(), 3);
+}
+
+#[test]
+fn recent_route_reads_playback_history_not_download_time() {
+    let (_directory, app) = test_app();
+    let first = app
+        .services
+        .library
+        .ensure_catalog(&CatalogTrack {
+            ncm_id: 101,
+            title: "先听".into(),
+            artists: "A".into(),
+            album: "X".into(),
+            duration_ms: 1000,
+            cover_url: String::new(),
+        })
+        .unwrap();
+    let second = app
+        .services
+        .library
+        .ensure_catalog(&CatalogTrack {
+            ncm_id: 102,
+            title: "后听".into(),
+            artists: "B".into(),
+            album: "Y".into(),
+            duration_ms: 1000,
+            cover_url: String::new(),
+        })
+        .unwrap();
+    app.services
+        .library
+        .record_play(first, PlayOrigin::Stream)
+        .unwrap();
+    app.services
+        .library
+        .record_play(second, PlayOrigin::Stream)
+        .unwrap();
+    let (tracks, _) = query_local(
+        &app.services.library,
+        Route::Recent,
+        None,
+        &LocalLayer::Menu,
+        TrackSort::Title,
+    )
+    .unwrap();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].title, "后听");
+    assert_eq!(tracks[1].title, "先听");
 }

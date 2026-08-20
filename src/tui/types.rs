@@ -468,6 +468,7 @@ pub(super) enum LyricsState {
 #[derive(Clone)]
 pub(super) struct TrackRow {
     pub(super) id: u64,
+    pub(super) ncm_id: Option<u64>,
     pub(super) title: String,
     pub(super) artists: String,
     pub(super) album: String,
@@ -480,20 +481,32 @@ pub(super) struct TrackRow {
     pub(super) cover_url: String,
 }
 
+impl TrackRow {
+    pub(super) fn catalog_id(&self) -> Option<u64> {
+        self.ncm_id.filter(|id| *id > 0)
+    }
+
+    pub(super) fn same_identity(&self, other: &Self) -> bool {
+        (self.id != 0 && other.id != 0 && self.id == other.id)
+            || matches!((self.ncm_id, other.ncm_id), (Some(left), Some(right)) if left == right)
+    }
+}
+
 impl From<Track> for TrackRow {
     fn from(track: Track) -> Self {
         Self {
             id: track.id,
+            ncm_id: track.ncm_id,
             title: track.title,
             artists: track.artists,
             album: track.album,
             duration_ms: track.duration_ms,
-            path: Some(track.path),
+            path: track.path,
             favorite: track.favorite,
             play_count: track.play_count,
             format: track.format,
             bytes: track.bytes,
-            cover_url: String::new(),
+            cover_url: track.cover_url,
         }
     }
 }
@@ -501,7 +514,8 @@ impl From<Track> for TrackRow {
 impl From<OnlineTrack> for TrackRow {
     fn from(track: OnlineTrack) -> Self {
         Self {
-            id: track.id,
+            id: 0,
+            ncm_id: Some(track.id),
             title: track.title,
             artists: track.artists,
             album: track.album,

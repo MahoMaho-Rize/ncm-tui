@@ -43,14 +43,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::create_dir_all(config.download.dir.join(".ncm-tui"));
         let _ = std::fs::write(&ui_state_path, "hide_lyrics = true\n");
     }
+    let library = Library::open(&config.download.dir)?;
+    let downloader = Downloader::new(client.clone(), &library, config.download.max_workers)?;
     let services = Services {
         authentication: Authentication::new(client.clone(), config.auth.session_file),
         discovery: Discovery::with_lyrics_dir(
             client.clone(),
             config.download.dir.join(".ncm-tui").join("lyrics"),
         ),
-        library: Library::open(&config.download.dir)?,
-        downloader: Downloader::new(client, &config.download.dir, config.download.max_workers)?,
+        library,
+        downloader,
         library_roots,
         playback_cache,
         ui_state_path,
