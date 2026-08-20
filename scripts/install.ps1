@@ -3,7 +3,7 @@
 #   irm https://mahomaho-rize.com/ncm-tui/install.ps1 | iex
 #
 # Optional environment:
-#   NCM_TUI_VERSION       pin a version, e.g. 0.1.3
+#   NCM_TUI_VERSION       pin a version, e.g. 0.1.4
 #   NCM_TUI_INSTALL_DIR   install directory (default: %LOCALAPPDATA%\ncm-tui)
 #   NCM_TUI_BASE_URL      artifact base
 
